@@ -8,6 +8,7 @@ package log
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -25,8 +26,14 @@ var (
 	// that have already been committed.
 	ErrUnknownBatch = errors.New("log: unknown batch")
 	// ErrCorruptSegment is returned when a segment file fails validation
-	// while opening or scanning the log.
+	// while opening or scanning the log: a malformed entry anywhere other
+	// than a torn tail of the newest segment, a checksum mismatch, or a
+	// truncated earlier segment.
 	ErrCorruptSegment = errors.New("log: corrupt segment")
+	// ErrSyncFailed is returned by Commit when writing the batch to its
+	// segment or syncing the segment file fails. The batch stays staged
+	// and uncommitted and may be committed again.
+	ErrSyncFailed = errors.New("log: segment write or sync failed")
 	// ErrInvalidOptions is returned by Open when the options are not
 	// usable, e.g. a non-positive segment capacity.
 	ErrInvalidOptions = errors.New("log: invalid options")
@@ -118,15 +125,28 @@ func Open(dir string, opts Options) (*Log, error) {
 		staged:    make(map[uint64][][]byte),
 		committed: make(map[uint64][][]byte),
 	}
-	for _, n := range indices {
-		data, err := os.ReadFile(l.segmentPath(n))
+	// curBatches must reflect only the newest file, so track that file's
+	// complete-batch count separately across the loop.
+	lastSegBatches := 0
+	for i, n := range indices {
+		path := l.segmentPath(n)
+		data, err := os.ReadFile(path)
 		if err != nil {
 			return nil, err
 		}
-		batches, err := parseSegment(data)
-		if err != nil {
-			return nil, err
+		batches, consumed, perr := parseSegment(data)
+		if perr != nil {
+			if i == len(indices)-1 && errors.Is(perr, errTrailingEntry) {
+				// Crash tail in the newest segment: the last batch never
+				// finished landing. Drop it as if it were never committed.
+				if err := os.Truncate(path, int64(consumed)); err != nil {
+					return nil, err
+				}
+			} else {
+				return nil, ErrCorruptSegment
+			}
 		}
+		lastSegBatches = len(batches)
 		if len(batches) == 0 {
 			continue // empty segment, e.g. created just before a crash
 		}
@@ -150,6 +170,7 @@ func Open(dir string, opts Options) (*Log, error) {
 		if err := l.openCurrent(); err != nil {
 			return nil, err
 		}
+		l.curBatches = lastSegBatches
 	}
 	return l, nil
 }
@@ -172,6 +193,10 @@ func (l *Log) Append(records [][]byte) (Batch, error) {
 // Commit makes a staged batch durable and readable, and returns its
 // reserved sequence number. Committing a batch that is not staged —
 // including one already committed — returns ErrUnknownBatch.
+//
+// If writing the batch or syncing it to disk fails, Commit returns
+// ErrSyncFailed; the batch stays staged and uncommitted, and the segment
+// is rolled back to its pre-commit length so the batch can be retried.
 func (l *Log) Commit(b Batch) (uint64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -183,12 +208,16 @@ func (l *Log) Commit(b Batch) (uint64, error) {
 		return 0, ErrUnknownBatch
 	}
 	entry := encodeBatch(b.seq, recs)
-	if err := l.writeEntry(entry); err != nil {
-		return 0, err
+	base, err := l.writeEntry(entry)
+	if err != nil {
+		l.abortEntry(base)
+		return 0, ErrSyncFailed
 	}
-	var syncErr error
 	if l.opts.Sync {
-		syncErr = l.file.Sync()
+		if err := l.file.Sync(); err != nil {
+			l.abortEntry(base)
+			return 0, ErrSyncFailed
+		}
 	}
 	delete(l.staged, b.seq)
 	l.committed[b.seq] = recs
@@ -204,7 +233,7 @@ func (l *Log) Commit(b Batch) (uint64, error) {
 		}
 	}
 	l.curBatches++
-	return b.seq, syncErr
+	return b.seq, nil
 }
 
 // Read returns the records of the committed batch with the given
@@ -279,13 +308,28 @@ func (l *Log) Close() error {
 	return nil
 }
 
+// writeBase captures the segment state before a commit writes its entry,
+// so abortEntry can roll a failed write back exactly.
+type writeBase struct {
+	file       *os.File // open file before the write, nil if none was open
+	segIndex   int
+	fileSize   int
+	curBatches int
+}
+
 // writeEntry appends one encoded batch to the current segment, rolling
 // to a new segment when the current one is non-empty and would exceed
-// the configured capacity.
-func (l *Log) writeEntry(entry []byte) error {
+// the configured capacity. It returns the state to restore on failure.
+func (l *Log) writeEntry(entry []byte) (writeBase, error) {
+	base := writeBase{
+		file:       l.file,
+		segIndex:   l.segIndex,
+		fileSize:   l.fileSize,
+		curBatches: l.curBatches,
+	}
 	if l.file != nil && l.fileSize > 0 && l.fileSize+len(entry) > l.opts.SegmentBytes {
 		if err := l.file.Close(); err != nil {
-			return err
+			return base, err
 		}
 		l.file = nil
 		l.segIndex++
@@ -296,15 +340,49 @@ func (l *Log) writeEntry(entry []byte) error {
 			l.segIndex = 1
 		}
 		if err := l.openCurrent(); err != nil {
-			return err
+			return base, err
 		}
 	}
 	n, err := l.file.Write(entry)
-	if err != nil {
-		return err
-	}
 	l.fileSize += n
-	return nil
+	if err != nil {
+		return base, err
+	}
+	if n != len(entry) {
+		return base, io.ErrShortWrite
+	}
+	return base, nil
+}
+
+// abortEntry undoes a failed commit: it truncates a partially written
+// entry out of the current segment, or removes a freshly opened segment
+// and reopens the previous one when the commit triggered a roll.
+func (l *Log) abortEntry(base writeBase) {
+	if l.file != base.file {
+		if l.file != nil {
+			l.file.Close()
+			os.Remove(l.segmentPath(l.segIndex))
+			l.file = nil
+		}
+		l.segIndex = base.segIndex
+		l.curBatches = base.curBatches
+		if base.file != nil {
+			// The previous file was closed while rolling; reopen it. Its
+			// size comes back from stat in openCurrent.
+			if err := l.openCurrent(); err != nil {
+				l.file = nil
+				l.fileSize = 0
+			}
+		} else {
+			l.fileSize = 0
+		}
+		return
+	}
+	if l.file != nil && l.fileSize != base.fileSize {
+		if err := l.file.Truncate(int64(base.fileSize)); err == nil {
+			l.fileSize = base.fileSize
+		}
+	}
 }
 
 func (l *Log) openCurrent() error {

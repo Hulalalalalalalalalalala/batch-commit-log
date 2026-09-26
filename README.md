@@ -20,7 +20,11 @@ Go 1.22 or newer. Standard library only.
 - `(*Log).Scan(from uint64, fn func(Batch) error) error` replays committed batches in order.
 - `(*Log).Segments() []Segment` lists segments with their first and last sequence.
 - `type Options struct { SegmentBytes int; Sync bool }`.
-- `log.ErrNotCommitted`, `log.ErrCorruptSegment`, `log.ErrUnknownBatch` error values.
+- `log.ErrNotCommitted`, `log.ErrCorruptSegment`, `log.ErrUnknownBatch`, `log.ErrSyncFailed` error values.
+
+A torn tail in the newest segment (an unfinished write left by a crash)
+is discarded on open; malformed or checksum-mismatched entries anywhere
+else make Open fail with `ErrCorruptSegment`.
 
 ## Tests
 
