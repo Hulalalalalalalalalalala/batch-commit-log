@@ -3,6 +3,11 @@
 // A writer stages a batch of opaque records with Append and publishes it
 // atomically with Commit. Readers only ever see committed batches, in
 // strictly increasing sequence order starting at 1.
+//
+// On open, a torn tail left by a crash mid-write on the latest segment
+// is discarded as never committed; corruption anywhere else — a bad
+// magic, a checksum mismatch, a truncated earlier segment — fails with
+// ErrCorruptSegment.
 package log
 
 import (
@@ -27,6 +32,9 @@ var (
 	// ErrCorruptSegment is returned when a segment file fails validation
 	// while opening or scanning the log.
 	ErrCorruptSegment = errors.New("log: corrupt segment")
+	// ErrSyncFailed is returned by Commit when writing or syncing the
+	// batch to its segment file fails. The batch stays uncommitted.
+	ErrSyncFailed = errors.New("log: sync failed")
 	// ErrInvalidOptions is returned by Open when the options are not
 	// usable, e.g. a non-positive segment capacity.
 	ErrInvalidOptions = errors.New("log: invalid options")
@@ -118,14 +126,23 @@ func Open(dir string, opts Options) (*Log, error) {
 		staged:    make(map[uint64][][]byte),
 		committed: make(map[uint64][][]byte),
 	}
-	for _, n := range indices {
+	for i, n := range indices {
 		data, err := os.ReadFile(l.segmentPath(n))
 		if err != nil {
 			return nil, err
 		}
-		batches, err := parseSegment(data)
+		last := i == len(indices)-1
+		batches, validLen, err := parseSegment(data, last)
 		if err != nil {
 			return nil, err
+		}
+		if validLen < len(data) {
+			// A crash left a torn tail on the latest segment: treat the
+			// unfinished batch as never committed and drop its bytes so
+			// future commits append right after the last complete one.
+			if err := os.Truncate(l.segmentPath(n), int64(validLen)); err != nil {
+				return nil, err
+			}
 		}
 		if len(batches) == 0 {
 			continue // empty segment, e.g. created just before a crash
@@ -143,6 +160,9 @@ func Open(dir string, opts Options) (*Log, error) {
 		l.segs = append(l.segs, seg)
 		if seg.LastSeq >= l.nextSeq {
 			l.nextSeq = seg.LastSeq + 1
+		}
+		if last {
+			l.curBatches = len(batches)
 		}
 	}
 	if len(indices) > 0 {
@@ -171,7 +191,9 @@ func (l *Log) Append(records [][]byte) (Batch, error) {
 
 // Commit makes a staged batch durable and readable, and returns its
 // reserved sequence number. Committing a batch that is not staged —
-// including one already committed — returns ErrUnknownBatch.
+// including one already committed — returns ErrUnknownBatch. If the
+// batch cannot be written or synced to its segment file, Commit returns
+// ErrSyncFailed and the batch stays staged.
 func (l *Log) Commit(b Batch) (uint64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -184,11 +206,13 @@ func (l *Log) Commit(b Batch) (uint64, error) {
 	}
 	entry := encodeBatch(b.seq, recs)
 	if err := l.writeEntry(entry); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("%w: %w", ErrSyncFailed, err)
 	}
-	var syncErr error
 	if l.opts.Sync {
-		syncErr = l.file.Sync()
+		if err := l.file.Sync(); err != nil {
+			l.undoWrite(len(entry))
+			return 0, fmt.Errorf("%w: %w", ErrSyncFailed, err)
+		}
 	}
 	delete(l.staged, b.seq)
 	l.committed[b.seq] = recs
@@ -204,7 +228,7 @@ func (l *Log) Commit(b Batch) (uint64, error) {
 		}
 	}
 	l.curBatches++
-	return b.seq, syncErr
+	return b.seq, nil
 }
 
 // Read returns the records of the committed batch with the given
@@ -301,10 +325,22 @@ func (l *Log) writeEntry(entry []byte) error {
 	}
 	n, err := l.file.Write(entry)
 	if err != nil {
+		// Roll back a partial write so the segment still ends at the
+		// last complete entry and the batch can be retried.
+		l.file.Truncate(int64(l.fileSize)) // best effort
 		return err
 	}
 	l.fileSize += n
 	return nil
+}
+
+// undoWrite removes a just-written entry whose sync failed, so the
+// segment ends at the last durable entry and the batch stays staged.
+func (l *Log) undoWrite(entryLen int) {
+	if l.file != nil {
+		l.file.Truncate(int64(l.fileSize - entryLen)) // best effort
+	}
+	l.fileSize -= entryLen
 }
 
 func (l *Log) openCurrent() error {
