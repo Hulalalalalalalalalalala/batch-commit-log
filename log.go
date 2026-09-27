@@ -81,21 +81,33 @@ type Segment struct {
 
 // entryRef locates one committed batch body inside a segment file. The
 // index is rebuilt from the segment files every time the log opens, so
-// its loss or invalidation is always safe.
+// its loss or invalidation is always safe. gen is the publication
+// generation of the commit that published the batch; every member of a
+// group commit shares one gen, which lets a streaming replay snapshot
+// see the whole group or none of it.
 type entryRef struct {
 	seg    int // segment file number
 	off    int // offset of the batch body within the segment
 	length int // length of the batch body
+	gen    uint64
 }
 
 // Log is an append-only batch-commit log stored in a directory of
 // segment files. It is safe for concurrent use, but the writer side is
 // expected to be a single goroutine (see README Limits).
+//
+// The read and write paths are decoupled: writers take mu exclusively,
+// while readers hold it only for the brief index and staged-state
+// lookups. Segment file reads, decoding and user callbacks happen
+// outside the lock, so a slow reader or a long replay never blocks a
+// committing writer.
 type Log struct {
 	dir  string
 	opts Options
 
-	mu         sync.Mutex
+	// mu guards the mutable index and write state below. Readers never
+	// hold it across file I/O, decoding or callbacks.
+	mu         sync.RWMutex
 	file       *os.File // current segment, nil until first write
 	fileSize   int
 	segIndex   int // index of the current segment file, 0 = none yet
@@ -104,6 +116,7 @@ type Log struct {
 	staged     map[uint64][][]byte
 	index      map[uint64]entryRef
 	segs       []Segment // segments holding at least one committed batch
+	gen        uint64    // publication generation of the last commit
 	closed     bool
 }
 
@@ -254,7 +267,8 @@ func (l *Log) Commit(b Batch) (uint64, error) {
 		}
 	}
 	delete(l.staged, b.seq)
-	l.index[b.seq] = entryRef{seg: l.segIndex, off: off + len(segmentMagic), length: len(entry) - len(segmentMagic) - 4}
+	l.gen++
+	l.index[b.seq] = entryRef{seg: l.segIndex, off: off + len(segmentMagic), length: len(entry) - len(segmentMagic) - 4, gen: l.gen}
 	l.commitSpan(b.seq, b.seq, 1)
 	return b.seq, nil
 }
@@ -311,9 +325,10 @@ func (l *Log) CommitGroup(batches []Batch) ([]uint64, error) {
 		}
 	}
 	first, last := seqs[0], seqs[0]
+	l.gen++
 	for i, m := range members {
 		delete(l.staged, m.seq)
-		l.index[m.seq] = entryRef{seg: l.segIndex, off: base + offs[i], length: lens[i]}
+		l.index[m.seq] = entryRef{seg: l.segIndex, off: base + offs[i], length: lens[i], gen: l.gen}
 		if m.seq < first {
 			first = m.seq
 		}
@@ -330,52 +345,83 @@ func (l *Log) CommitGroup(batches []Batch) ([]uint64, error) {
 // but uncommitted sequence yields ErrNotCommitted; sequence 0,
 // never-reserved sequences, and sequences beyond the reserved range
 // yield ErrUnknownBatch.
+//
+// The lock is held only for the index lookup; the segment file is read
+// and the body decoded without it, so a slow read never blocks writers.
 func (l *Log) Read(seq uint64) ([][]byte, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.mu.RLock()
 	if l.closed {
+		l.mu.RUnlock()
 		return nil, errClosed
 	}
-	if _, ok := l.index[seq]; !ok {
-		if _, ok := l.staged[seq]; ok {
+	ref, ok := l.index[seq]
+	if !ok {
+		_, staged := l.staged[seq]
+		l.mu.RUnlock()
+		if staged {
 			return nil, ErrNotCommitted
 		}
 		return nil, ErrUnknownBatch
 	}
-	return l.readLocked(seq)
+	l.mu.RUnlock()
+	return l.readRef(seq, ref)
+}
+
+// scanSnapshot is a read-consistent visibility boundary: a batch is
+// visible only when its publication generation is <= gen and its
+// sequence is <= highSeq. The boundary is captured in one brief
+// read-lock acquisition, so a group that commits after a replay starts
+// (even one filling an earlier reserved hole) is either wholly inside
+// the snapshot or wholly outside it.
+type scanSnapshot struct {
+	gen     uint64
+	highSeq uint64
 }
 
 // Scan replays committed batches with sequence >= from in increasing
-// sequence order, stopping at the first error returned by fn. The
-// replay is a consistent snapshot: batches committed during the replay
-// are invisible to it.
+// sequence order, stopping at the first error returned by fn.
+//
+// The replay is a consistent snapshot: batches committed after the
+// replay starts are invisible to it, and a group commit is seen either
+// whole or not at all. The replay streams batches straight from the
+// segment files one sequence at a time and keeps only the current
+// batch in memory; it never loads the whole replay first. Each
+// sequence lookup takes the lock briefly, while the file read, decode
+// and the fn callback all run outside it, so a long replay never
+// blocks writers.
 func (l *Log) Scan(from uint64, fn func(Batch) error) error {
-	l.mu.Lock()
+	l.mu.RLock()
 	if l.closed {
-		l.mu.Unlock()
+		l.mu.RUnlock()
 		return errClosed
 	}
-	seqs := make([]uint64, 0, len(l.index))
-	for seq := range l.index {
-		if seq >= from {
-			seqs = append(seqs, seq)
-		}
+	snap := scanSnapshot{gen: l.gen, highSeq: l.nextSeq - 1}
+	l.mu.RUnlock()
+
+	if from > snap.highSeq {
+		return nil
 	}
-	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
-	batches := make([]Batch, 0, len(seqs))
-	for _, seq := range seqs {
-		records, err := l.readLocked(seq)
-		if err != nil {
-			l.mu.Unlock()
-			return err
+	for seq := from; ; {
+		// One brief read-lock per sequence: only the index metadata is
+		// touched while holding it.
+		l.mu.RLock()
+		ref, ok := l.index[seq]
+		l.mu.RUnlock()
+		// Skip holes (reserved but uncommitted sequences) and batches
+		// published after the snapshot was taken.
+		if ok && ref.gen <= snap.gen {
+			records, err := l.readRef(seq, ref)
+			if err != nil {
+				return err
+			}
+			if err := fn(Batch{seq: seq, records: records, owner: l}); err != nil {
+				return err
+			}
 		}
-		batches = append(batches, Batch{seq: seq, records: records, owner: l})
-	}
-	l.mu.Unlock()
-	for _, b := range batches {
-		if err := fn(b); err != nil {
-			return err
+		if seq == snap.highSeq {
+			break
 		}
+		seq++
 	}
 	return nil
 }
@@ -383,8 +429,8 @@ func (l *Log) Scan(from uint64, fn func(Batch) error) error {
 // Segments lists the segments that hold committed batches, in file
 // order, each with its first and last committed sequence.
 func (l *Log) Segments() []Segment {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	out := make([]Segment, len(l.segs))
 	copy(out, l.segs)
 	return out
@@ -405,11 +451,16 @@ func (l *Log) Close() error {
 	return nil
 }
 
-// readLocked loads the records of a committed batch through the index.
-// The caller must hold l.mu. The returned records are freshly decoded,
-// so callers can mutate them without affecting the log.
-func (l *Log) readLocked(seq uint64) ([][]byte, error) {
-	ref := l.index[seq]
+// readRef loads the records of a committed batch straight from its
+// segment file. It performs no locking and must be called without l.mu
+// held: the segment read and body decode happen entirely on the read
+// path, outside the writer lock. The on-disk bytes are immutable once
+// committed (only the torn tail of the very last segment is ever
+// rewritten, and that tail never has an index entry), so a ref captured
+// under the read lock stays valid afterwards. The returned records are
+// freshly decoded, so callers can mutate them without affecting the
+// log or later reads.
+func (l *Log) readRef(seq uint64, ref entryRef) ([][]byte, error) {
 	f, err := os.Open(l.segmentPath(ref.seg))
 	if err != nil {
 		return nil, err
