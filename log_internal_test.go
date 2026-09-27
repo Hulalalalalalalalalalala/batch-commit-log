@@ -69,3 +69,76 @@ func TestSyncFailureKeepsBatchStaged(t *testing.T) {
 		t.Fatalf("replayed %d batches, want 1", count)
 	}
 }
+
+func TestGroupSyncFailureKeepsAllStaged(t *testing.T) {
+	dir := t.TempDir()
+	l, err := Open(dir, Options{SegmentBytes: 1 << 20, Sync: true})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer l.Close()
+
+	boom := errors.New("fsync boom")
+	failing := true
+	orig := syncFile
+	defer func() { syncFile = orig }()
+	syncFile = func(f *os.File) error {
+		if failing {
+			return boom
+		}
+		return orig(f)
+	}
+
+	b1, err := l.Append([][]byte{[]byte("a")})
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	b2, err := l.Append([][]byte{[]byte("b")})
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if _, err := l.CommitGroup([]Batch{b1, b2}); !errors.Is(err, ErrSyncFailed) {
+		t.Fatalf("CommitGroup err = %v, want ErrSyncFailed", err)
+	}
+	// All or nothing: every batch of the group stays staged and keeps
+	// its reserved sequence.
+	for _, seq := range []uint64{1, 2} {
+		if _, err := l.Read(seq); !errors.Is(err, ErrNotCommitted) {
+			t.Fatalf("Read(%d) err = %v, want ErrNotCommitted", seq, err)
+		}
+	}
+	// The un-synced group entry was rolled back cleanly, so the retry
+	// cannot duplicate it.
+	if l.fileSize != 0 {
+		t.Fatalf("fileSize after failed sync = %d, want 0", l.fileSize)
+	}
+	failing = false
+	seqs, err := l.CommitGroup([]Batch{b1, b2})
+	if err != nil {
+		t.Fatalf("retry CommitGroup: %v", err)
+	}
+	if len(seqs) != 2 || seqs[0] != 1 || seqs[1] != 2 {
+		t.Fatalf("retry seqs = %v, want [1 2]", seqs)
+	}
+	for seq, want := range map[uint64]string{1: "a", 2: "b"} {
+		got, err := l.Read(seq)
+		if err != nil || len(got) != 1 || string(got[0]) != want {
+			t.Fatalf("Read(%d) = %q, %v; want %q", seq, got, err, want)
+		}
+	}
+	l.Close()
+
+	// After a reopen exactly two batches are on disk: no duplicates.
+	l2, err := Open(dir, Options{SegmentBytes: 1 << 20, Sync: true})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer l2.Close()
+	count := 0
+	if err := l2.Scan(1, func(Batch) error { count++; return nil }); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("replayed %d batches, want 2", count)
+	}
+}
