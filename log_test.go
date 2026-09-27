@@ -1,11 +1,13 @@
 package log_test
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
 
 	log "github.com/Hulalalalalalalalalalala/batch-commit-log"
@@ -255,44 +257,58 @@ func TestEmptyLogHasNoSegments(t *testing.T) {
 }
 
 func TestCorruptSegmentDetected(t *testing.T) {
-	newCorruptLog := func(t *testing.T, mutate func([]byte) []byte) string {
+	// newCorruptLog writes two one-batch segments and mutates one of
+	// them. Mutating an earlier segment can never look like a crash's
+	// torn tail, which only the last segment may carry.
+	newCorruptLog := func(t *testing.T, last bool, mutate func([]byte) []byte) string {
 		dir := t.TempDir()
-		l := open(t, dir, log.Options{SegmentBytes: 1 << 20})
-		commit(t, l, []byte("payload"))
+		l := open(t, dir, log.Options{SegmentBytes: 32})
+		commit(t, l, []byte("rec-0"))
+		commit(t, l, []byte("rec-1"))
 		l.Close()
 
-		files, err := filepath.Glob(filepath.Join(dir, "*.seg"))
-		if err != nil || len(files) != 1 {
-			t.Fatalf("segment files = %v, %v", files, err)
+		name := "000001.seg"
+		if last {
+			name = "000002.seg"
 		}
-		data, err := os.ReadFile(files[0])
+		path := filepath.Join(dir, name)
+		data, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(files[0], mutate(data), 0o644); err != nil {
+		if err := os.WriteFile(path, mutate(data), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		return dir
 	}
 
 	t.Run("tampered", func(t *testing.T) {
-		dir := newCorruptLog(t, func(d []byte) []byte {
-			d[len(d)/2] ^= 0xff
+		dir := newCorruptLog(t, false, func(d []byte) []byte {
+			d[len(d)-1] ^= 0xff // corrupt the trailing checksum
 			return d
 		})
-		if _, err := log.Open(dir, log.Options{SegmentBytes: 1 << 20}); !errors.Is(err, log.ErrCorruptSegment) {
+		if _, err := log.Open(dir, log.Options{SegmentBytes: 32}); !errors.Is(err, log.ErrCorruptSegment) {
+			t.Fatalf("Open err = %v, want ErrCorruptSegment", err)
+		}
+	})
+	t.Run("tampered-last-segment", func(t *testing.T) {
+		dir := newCorruptLog(t, true, func(d []byte) []byte {
+			d[len(d)-1] ^= 0xff // full-length entry, bad checksum: not a torn write
+			return d
+		})
+		if _, err := log.Open(dir, log.Options{SegmentBytes: 32}); !errors.Is(err, log.ErrCorruptSegment) {
 			t.Fatalf("Open err = %v, want ErrCorruptSegment", err)
 		}
 	})
 	t.Run("truncated", func(t *testing.T) {
-		dir := newCorruptLog(t, func(d []byte) []byte { return d[:len(d)-3] })
-		if _, err := log.Open(dir, log.Options{SegmentBytes: 1 << 20}); !errors.Is(err, log.ErrCorruptSegment) {
+		dir := newCorruptLog(t, false, func(d []byte) []byte { return d[:len(d)-3] })
+		if _, err := log.Open(dir, log.Options{SegmentBytes: 32}); !errors.Is(err, log.ErrCorruptSegment) {
 			t.Fatalf("Open err = %v, want ErrCorruptSegment", err)
 		}
 	})
 	t.Run("garbage", func(t *testing.T) {
-		dir := newCorruptLog(t, func(d []byte) []byte { return []byte("not a segment") })
-		if _, err := log.Open(dir, log.Options{SegmentBytes: 1 << 20}); !errors.Is(err, log.ErrCorruptSegment) {
+		dir := newCorruptLog(t, false, func(d []byte) []byte { return []byte("not a segment") })
+		if _, err := log.Open(dir, log.Options{SegmentBytes: 32}); !errors.Is(err, log.ErrCorruptSegment) {
 			t.Fatalf("Open err = %v, want ErrCorruptSegment", err)
 		}
 	})
@@ -335,5 +351,267 @@ func TestRecordsAreOpaqueAndCopied(t *testing.T) {
 	again, _ := l.Read(b.Seq())
 	if again[0][1] != 0xff {
 		t.Fatalf("log content mutated through returned slice")
+	}
+}
+
+// appendTornEntry simulates a crash mid-commit: it writes the beginning
+// of a batch entry for seq — header complete, record cut short, no
+// checksum — to the end of the last segment file.
+func appendTornEntry(t *testing.T, dir string, seq uint64, record string) {
+	t.Helper()
+	var buf []byte
+	buf = append(buf, 'B', 'C', 'L', '1')
+	var tmp [8]byte
+	binary.LittleEndian.PutUint64(tmp[:], seq)
+	buf = append(buf, tmp[:]...)
+	binary.LittleEndian.PutUint32(tmp[:4], 1)
+	buf = append(buf, tmp[:4]...)
+	binary.LittleEndian.PutUint32(tmp[:4], uint32(len(record)))
+	buf = append(buf, tmp[:4]...)
+	buf = append(buf, record[:len(record)/2]...) // torn mid-record
+
+	files, err := filepath.Glob(filepath.Join(dir, "*.seg"))
+	if err != nil || len(files) == 0 {
+		t.Fatalf("segment files = %v, %v", files, err)
+	}
+	f, err := os.OpenFile(files[len(files)-1], os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(buf); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTornTailDiscarded(t *testing.T) {
+	dir := t.TempDir()
+	opts := log.Options{SegmentBytes: 1 << 20}
+
+	l := open(t, dir, opts)
+	commit(t, l, []byte("one"))
+	commit(t, l, []byte("two"))
+	l.Close()
+
+	appendTornEntry(t, dir, 3, "three")
+
+	// The torn tail neither errors nor becomes visible.
+	l = open(t, dir, opts)
+	if got, err := l.Read(2); err != nil || string(got[0]) != "two" {
+		t.Fatalf("Read(2) = %q, %v", got, err)
+	}
+	if _, err := l.Read(3); !errors.Is(err, log.ErrNotCommitted) {
+		t.Fatalf("Read(3) err = %v, want ErrNotCommitted", err)
+	}
+	var seqs []uint64
+	if err := l.Scan(1, func(b log.Batch) error { seqs = append(seqs, b.Seq()); return nil }); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if !reflect.DeepEqual(seqs, []uint64{1, 2}) {
+		t.Fatalf("scan seqs = %v, want [1 2]", seqs)
+	}
+
+	// A reopen with no commits in between still finds the torn tail, so
+	// the reserved sequence is neither rolled back nor reused.
+	l.Close()
+	l = open(t, dir, opts)
+	if _, err := l.Read(3); !errors.Is(err, log.ErrNotCommitted) {
+		t.Fatalf("after quiet reopen Read(3) err = %v, want ErrNotCommitted", err)
+	}
+	b, err := l.Append([][]byte{[]byte("four")})
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if b.Seq() != 4 {
+		t.Fatalf("next seq after torn tail = %d, want 4", b.Seq())
+	}
+	if _, err := l.Commit(b); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	l.Close()
+
+	// The next write cut the torn bytes away; seq 3 stays a permanent
+	// hole that replay skips.
+	l = open(t, dir, opts)
+	if _, err := l.Read(3); errors.Is(err, log.ErrNotCommitted) {
+		t.Fatalf("seq 3 must not be committed by recovery")
+	}
+	seqs = nil
+	if err := l.Scan(1, func(b log.Batch) error { seqs = append(seqs, b.Seq()); return nil }); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if !reflect.DeepEqual(seqs, []uint64{1, 2, 4}) {
+		t.Fatalf("scan seqs = %v, want [1 2 4]", seqs)
+	}
+	if got, err := l.Read(4); err != nil || string(got[0]) != "four" {
+		t.Fatalf("Read(4) = %q, %v", got, err)
+	}
+}
+
+func TestTornTailInEarlierSegmentIsCorrupt(t *testing.T) {
+	dir := t.TempDir()
+	l := open(t, dir, log.Options{SegmentBytes: 32})
+	commit(t, l, []byte("rec-0"))
+	commit(t, l, []byte("rec-1"))
+	l.Close()
+
+	// A half-written entry anywhere but the last segment is tampering.
+	f, err := os.OpenFile(filepath.Join(dir, "000001.seg"), os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte{'B', 'C'}); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	if _, err := log.Open(dir, log.Options{SegmentBytes: 32}); !errors.Is(err, log.ErrCorruptSegment) {
+		t.Fatalf("Open err = %v, want ErrCorruptSegment", err)
+	}
+}
+
+func TestEmptyBatch(t *testing.T) {
+	dir := t.TempDir()
+	opts := log.Options{SegmentBytes: 1 << 20}
+	l := open(t, dir, opts)
+
+	seq := commit(t, l) // no records at all
+	got, err := l.Read(seq)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if got == nil || len(got) != 0 {
+		t.Fatalf("Read = %v, want empty record set", got)
+	}
+	var seen []uint64
+	if err := l.Scan(1, func(b log.Batch) error {
+		seen = append(seen, b.Seq())
+		if len(b.Records()) != 0 {
+			t.Fatalf("empty batch replayed with records")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if !reflect.DeepEqual(seen, []uint64{1}) {
+		t.Fatalf("scan seqs = %v, want [1]", seen)
+	}
+
+	l.Close()
+	l = open(t, dir, opts)
+	if got, err := l.Read(seq); err != nil || len(got) != 0 {
+		t.Fatalf("after reopen Read = %v, %v; want empty record set", got, err)
+	}
+}
+
+func TestScanIsSnapshot(t *testing.T) {
+	l := open(t, t.TempDir(), log.Options{SegmentBytes: 1 << 20})
+	commit(t, l, []byte("a"))
+	commit(t, l, []byte("b"))
+
+	var seen []uint64
+	err := l.Scan(1, func(b log.Batch) error {
+		seen = append(seen, b.Seq())
+		if b.Seq() == 1 {
+			commit(t, l, []byte("late")) // committed mid-scan
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if !reflect.DeepEqual(seen, []uint64{1, 2}) {
+		t.Fatalf("scan saw %v, want [1 2]; mid-scan commit leaked in", seen)
+	}
+
+	seen = nil
+	if err := l.Scan(1, func(b log.Batch) error { seen = append(seen, b.Seq()); return nil }); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if !reflect.DeepEqual(seen, []uint64{1, 2, 3}) {
+		t.Fatalf("second scan = %v, want [1 2 3]", seen)
+	}
+}
+
+func TestConcurrentReadAndScan(t *testing.T) {
+	l := open(t, t.TempDir(), log.Options{SegmentBytes: 1 << 20})
+	const batches = 50
+
+	var wg sync.WaitGroup
+	// The single writer.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 1; i <= batches; i++ {
+			b, err := l.Append([][]byte{[]byte(fmt.Sprintf("rec-%d", i))})
+			if err != nil {
+				t.Errorf("Append: %v", err)
+				return
+			}
+			if _, err := l.Commit(b); err != nil {
+				t.Errorf("Commit: %v", err)
+				return
+			}
+		}
+	}()
+	// Concurrent readers: whatever Read returns must be a consistent,
+	// immutable view of one committed batch.
+	for g := 0; g < 3; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 300; i++ {
+				seq := uint64(i%batches + 1)
+				got, err := l.Read(seq)
+				switch {
+				case errors.Is(err, log.ErrNotCommitted), errors.Is(err, log.ErrUnknownBatch):
+					continue
+				case err != nil:
+					t.Errorf("Read(%d): %v", seq, err)
+					return
+				}
+				want := fmt.Sprintf("rec-%d", seq)
+				if len(got) != 1 || string(got[0]) != want {
+					t.Errorf("Read(%d) = %q, want %q", seq, got, want)
+					return
+				}
+				got[0][0] = 'X' // must not corrupt the log
+			}
+		}()
+	}
+	// Concurrent replayers: every scan sees committed batches in order.
+	for g := 0; g < 2; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				var last uint64
+				err := l.Scan(1, func(b log.Batch) error {
+					if b.Seq() <= last {
+						t.Errorf("scan out of order: %d after %d", b.Seq(), last)
+					}
+					last = b.Seq()
+					return nil
+				})
+				if err != nil {
+					t.Errorf("Scan: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	// After the writer finished, every batch is readable and intact.
+	for seq := uint64(1); seq <= batches; seq++ {
+		got, err := l.Read(seq)
+		if err != nil {
+			t.Fatalf("Read(%d): %v", seq, err)
+		}
+		if want := fmt.Sprintf("rec-%d", seq); string(got[0]) != want {
+			t.Fatalf("Read(%d) = %q, want %q", seq, got[0], want)
+		}
 	}
 }

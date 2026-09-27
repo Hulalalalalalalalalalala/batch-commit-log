@@ -20,7 +20,11 @@ Go 1.22 or newer. Standard library only.
 - `(*Log).Scan(from uint64, fn func(Batch) error) error` replays committed batches in order.
 - `(*Log).Segments() []Segment` lists segments with their first and last sequence.
 - `type Options struct { SegmentBytes int; Sync bool }`.
-- `log.ErrNotCommitted`, `log.ErrCorruptSegment`, `log.ErrUnknownBatch` error values.
+- `log.ErrNotCommitted`, `log.ErrCorruptSegment`, `log.ErrUnknownBatch`, `log.ErrSyncFailed` error values.
+
+## Crash recovery
+
+A crash can leave a half-written entry at the tail of the last segment. On the next open that torn tail is discarded: it is never replayed, its batch reads as staged (`ErrNotCommitted`), and its reserved sequence is not reused — the next append continues after it. A batch whose commit was interrupted is therefore either fully readable or fully absent after reopening, never half present. Any other malformed content, in any segment, fails `Open` with `ErrCorruptSegment`. With `Options.Sync` set, a returned `Commit` is durable; a failed fsync reports `ErrSyncFailed` and leaves the batch staged.
 
 ## Tests
 
