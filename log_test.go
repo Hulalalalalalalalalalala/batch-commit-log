@@ -606,3 +606,232 @@ func TestConcurrentReadWrite(t *testing.T) {
 	close(done)
 	wg.Wait()
 }
+
+func TestCommitGroup(t *testing.T) {
+	l := open(t, t.TempDir(), log.Options{SegmentBytes: 1 << 20})
+
+	b1, _ := l.Append([][]byte{[]byte("a")})
+	b2, _ := l.Append([][]byte{[]byte("b1"), []byte("b2")})
+	b3, _ := l.Append(nil) // empty batches group-commit like any other
+	seqs, err := l.CommitGroup([]log.Batch{b3, b1, b2})
+	if err != nil {
+		t.Fatalf("CommitGroup: %v", err)
+	}
+	if !reflect.DeepEqual(seqs, []uint64{1, 2, 3}) {
+		t.Fatalf("group seqs = %v, want [1 2 3]", seqs)
+	}
+	// Each batch is visible under its own reserved sequence.
+	got, err := l.Read(2)
+	if err != nil || !reflect.DeepEqual(got, [][]byte{[]byte("b1"), []byte("b2")}) {
+		t.Fatalf("Read(2) = %q, %v", got, err)
+	}
+	if got, err := l.Read(3); err != nil || len(got) != 0 {
+		t.Fatalf("Read(3) = %v, %v; want empty record set", got, err)
+	}
+	// Replay yields the group in sequence order.
+	var seen []uint64
+	if err := l.Scan(1, func(b log.Batch) error {
+		seen = append(seen, b.Seq())
+		return nil
+	}); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if !reflect.DeepEqual(seen, []uint64{1, 2, 3}) {
+		t.Fatalf("scan seqs = %v, want [1 2 3]", seen)
+	}
+	// Group members are no longer staged.
+	if _, err := l.Commit(b1); !errors.Is(err, log.ErrUnknownBatch) {
+		t.Fatalf("Commit after group err = %v, want ErrUnknownBatch", err)
+	}
+}
+
+func TestCommitGroupRejectsUnstaged(t *testing.T) {
+	l := open(t, t.TempDir(), log.Options{SegmentBytes: 1 << 20})
+
+	b1, _ := l.Append([][]byte{[]byte("a")})
+	b2, _ := l.Append([][]byte{[]byte("b")})
+	if _, err := l.Commit(b2); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	// b2 is already committed: the whole group is rejected.
+	if _, err := l.CommitGroup([]log.Batch{b1, b2}); !errors.Is(err, log.ErrUnknownBatch) {
+		t.Fatalf("CommitGroup err = %v, want ErrUnknownBatch", err)
+	}
+	// b1 was not consumed by the failed group commit.
+	if _, err := l.Read(b1.Seq()); !errors.Is(err, log.ErrNotCommitted) {
+		t.Fatalf("Read(b1) err = %v, want ErrNotCommitted", err)
+	}
+	if seq, err := l.Commit(b1); err != nil || seq != 1 {
+		t.Fatalf("Commit(b1) = %d, %v; want 1, nil", seq, err)
+	}
+	// A duplicated batch in one group is rejected too.
+	b3, _ := l.Append([][]byte{[]byte("c")})
+	if _, err := l.CommitGroup([]log.Batch{b3, b3}); !errors.Is(err, log.ErrUnknownBatch) {
+		t.Fatalf("CommitGroup(dup) err = %v, want ErrUnknownBatch", err)
+	}
+}
+
+func TestCommitGroupSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	opts := log.Options{SegmentBytes: 1 << 20, Sync: true}
+
+	l := open(t, dir, opts)
+	b1, _ := l.Append([][]byte{[]byte("x")})
+	b2, _ := l.Append([][]byte{[]byte("y")})
+	if _, err := l.CommitGroup([]log.Batch{b1, b2}); err != nil {
+		t.Fatalf("CommitGroup: %v", err)
+	}
+	l.Close()
+
+	l = open(t, dir, opts)
+	for seq, want := range map[uint64]string{1: "x", 2: "y"} {
+		got, err := l.Read(seq)
+		if err != nil || len(got) != 1 || string(got[0]) != want {
+			t.Fatalf("Read(%d) = %q, %v; want %q", seq, got, err, want)
+		}
+	}
+	// The next append continues after the group's sequences.
+	if seq := commit(t, l, []byte("z")); seq != 3 {
+		t.Fatalf("seq after group reopen = %d, want 3", seq)
+	}
+}
+
+func TestCommitGroupRollsToOwnSegment(t *testing.T) {
+	dir := t.TempDir()
+	// Room for exactly one small entry per segment.
+	l := open(t, dir, log.Options{SegmentBytes: 32})
+
+	commit(t, l, []byte("one"))
+	b2, _ := l.Append([][]byte{[]byte("g1")})
+	b3, _ := l.Append([][]byte{[]byte("g2")})
+	if _, err := l.CommitGroup([]log.Batch{b2, b3}); err != nil {
+		t.Fatalf("CommitGroup: %v", err)
+	}
+	commit(t, l, []byte("end"))
+
+	segs := l.Segments()
+	if len(segs) != 3 {
+		t.Fatalf("len(Segments) = %d, want 3: %+v", len(segs), segs)
+	}
+	if segs[1].FirstSeq != 2 || segs[1].LastSeq != 3 {
+		t.Fatalf("group segment = %+v, want [2,3]", segs[1])
+	}
+	l.Close()
+
+	// The group frame survives a reopen and still reads back.
+	l = open(t, dir, log.Options{SegmentBytes: 32})
+	if got, err := l.Read(3); err != nil || string(got[0]) != "g2" {
+		t.Fatalf("Read(3) = %q, %v", got, err)
+	}
+	if segs := l.Segments(); len(segs) != 3 {
+		t.Fatalf("after reopen len(Segments) = %d, want 3", len(segs))
+	}
+}
+
+func TestCrashMidGroupLeavesNoHalfGroup(t *testing.T) {
+	dir := t.TempDir()
+	opts := log.Options{SegmentBytes: 64}
+
+	l := open(t, dir, opts)
+	commit(t, l, []byte("one"))
+	b2, _ := l.Append([][]byte{[]byte("g1")})
+	b3, _ := l.Append([][]byte{[]byte("g2")})
+	b4, _ := l.Append([][]byte{[]byte("g3")})
+	if _, err := l.CommitGroup([]log.Batch{b2, b3, b4}); err != nil {
+		t.Fatalf("CommitGroup: %v", err)
+	}
+	l.Close()
+
+	// Power loss partway through flushing the group frame: the file
+	// holds the header, one whole entry, and a piece of the next.
+	frame := mustReadFile(t, filepath.Join(dir, "000002.seg"))
+	headerLen := 12 + 8*3
+	entryLen := 24 + len("g1")
+	if len(frame) != headerLen+3*entryLen {
+		t.Fatalf("group frame = %d bytes, want %d", len(frame), headerLen+3*entryLen)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "000002.seg"), frame[:headerLen+entryLen+5], 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	l = open(t, dir, opts) // must not fail
+	if got, err := l.Read(1); err != nil || string(got[0]) != "one" {
+		t.Fatalf("Read(1) = %q, %v", got, err)
+	}
+	// No half group: every crashed batch stays staged, its sequence a
+	// permanent hole.
+	for _, seq := range []uint64{2, 3, 4} {
+		if _, err := l.Read(seq); !errors.Is(err, log.ErrNotCommitted) {
+			t.Fatalf("Read(%d) err = %v, want ErrNotCommitted", seq, err)
+		}
+	}
+	var seqs []uint64
+	if err := l.Scan(1, func(b log.Batch) error {
+		seqs = append(seqs, b.Seq())
+		return nil
+	}); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if !reflect.DeepEqual(seqs, []uint64{1}) {
+		t.Fatalf("scan seqs = %v, want [1]", seqs)
+	}
+	if seq := commit(t, l, []byte("next")); seq != 5 {
+		t.Fatalf("seq after group crash = %d, want 5", seq)
+	}
+	l.Close()
+
+	// The holes are never reused and the numbering never regresses,
+	// even across another reopen.
+	l = open(t, dir, opts)
+	var again []uint64
+	if err := l.Scan(1, func(b log.Batch) error {
+		again = append(again, b.Seq())
+		return nil
+	}); err != nil {
+		t.Fatalf("Scan after reopen: %v", err)
+	}
+	if !reflect.DeepEqual(again, []uint64{1, 5}) {
+		t.Fatalf("scan after reopen = %v, want [1 5]", again)
+	}
+	if seq := commit(t, l, []byte("six")); seq != 6 {
+		t.Fatalf("seq after second reopen = %d, want 6", seq)
+	}
+}
+
+func TestReadMatchesScanReplay(t *testing.T) {
+	dir := t.TempDir()
+	opts := log.Options{SegmentBytes: 48}
+
+	l := open(t, dir, opts)
+	commit(t, l, []byte("one"))
+	b2, _ := l.Append([][]byte{[]byte("two")})
+	b3, _ := l.Append([][]byte{[]byte("three")})
+	if _, err := l.CommitGroup([]log.Batch{b2, b3}); err != nil {
+		t.Fatalf("CommitGroup: %v", err)
+	}
+	commit(t, l, []byte("four"))
+	l.Close()
+
+	// The index is rebuilt from the segment files on open; indexed
+	// reads must agree exactly with a full replay.
+	l = open(t, dir, opts)
+	replayed := map[uint64][][]byte{}
+	if err := l.Scan(1, func(b log.Batch) error {
+		replayed[b.Seq()] = b.Records()
+		return nil
+	}); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(replayed) != 4 {
+		t.Fatalf("replayed %d batches, want 4", len(replayed))
+	}
+	for seq, want := range replayed {
+		got, err := l.Read(seq)
+		if err != nil {
+			t.Fatalf("Read(%d): %v", seq, err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("Read(%d) = %q, replay saw %q", seq, got, want)
+		}
+	}
+}

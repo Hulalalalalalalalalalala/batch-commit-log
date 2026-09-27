@@ -69,3 +69,73 @@ func TestSyncFailureKeepsBatchStaged(t *testing.T) {
 		t.Fatalf("replayed %d batches, want 1", count)
 	}
 }
+
+func TestGroupSyncFailureKeepsAllStaged(t *testing.T) {
+	dir := t.TempDir()
+	l, err := Open(dir, Options{SegmentBytes: 1 << 20, Sync: true})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer l.Close()
+
+	boom := errors.New("fsync boom")
+	failing := true
+	orig := syncFile
+	defer func() { syncFile = orig }()
+	syncFile = func(f *os.File) error {
+		if failing {
+			return boom
+		}
+		return orig(f)
+	}
+
+	b1, err := l.Append([][]byte{[]byte("x")})
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	b2, err := l.Append([][]byte{[]byte("y")})
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if _, err := l.CommitGroup([]Batch{b1, b2}); !errors.Is(err, ErrSyncFailed) {
+		t.Fatalf("CommitGroup err = %v, want ErrSyncFailed", err)
+	}
+	// The whole group stays staged; nothing becomes half visible.
+	for _, b := range []Batch{b1, b2} {
+		if _, err := l.Read(b.Seq()); !errors.Is(err, ErrNotCommitted) {
+			t.Fatalf("Read(%d) err = %v, want ErrNotCommitted", b.Seq(), err)
+		}
+	}
+	// The un-synced frame was rolled back cleanly.
+	if l.fileSize != 0 {
+		t.Fatalf("fileSize after failed sync = %d, want 0", l.fileSize)
+	}
+	// Retrying the same group commits it with the same sequences.
+	failing = false
+	seqs, err := l.CommitGroup([]Batch{b1, b2})
+	if err != nil {
+		t.Fatalf("retry CommitGroup: %v", err)
+	}
+	if len(seqs) != 2 || seqs[0] != 1 || seqs[1] != 2 {
+		t.Fatalf("retry seqs = %v, want [1 2]", seqs)
+	}
+	l.Close()
+
+	// After a reopen each sequence appears exactly once: the retry left
+	// no duplicate entries behind.
+	l2, err := Open(dir, Options{SegmentBytes: 1 << 20, Sync: true})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer l2.Close()
+	var seen []uint64
+	if err := l2.Scan(1, func(b Batch) error {
+		seen = append(seen, b.Seq())
+		return nil
+	}); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(seen) != 2 || seen[0] != 1 || seen[1] != 2 {
+		t.Fatalf("replayed seqs = %v, want [1 2]", seen)
+	}
+}
