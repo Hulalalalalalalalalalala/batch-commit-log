@@ -30,9 +30,17 @@ var (
 	// ErrInvalidOptions is returned by Open when the options are not
 	// usable, e.g. a non-positive segment capacity.
 	ErrInvalidOptions = errors.New("log: invalid options")
+	// ErrSyncFailed is returned by Commit when Options.Sync is set and
+	// fsyncing the segment file fails. The batch stays staged and keeps
+	// its reserved sequence; committing it again retries.
+	ErrSyncFailed = errors.New("log: sync failed")
 )
 
 var errClosed = errors.New("log: closed")
+
+// syncFile fsyncs a segment file. It is a variable so tests can
+// simulate sync failures.
+var syncFile = func(f *os.File) error { return f.Sync() }
 
 // Options configures a Log opened with Open.
 type Options struct {
@@ -87,6 +95,9 @@ type Log struct {
 
 // Open opens the log in dir, creating the directory if needed. Existing
 // segments are validated and their committed batches become readable.
+// A half-written tail of the last segment — the remnant of a crash
+// mid-write — is discarded without error and its reserved sequence
+// stays a permanent hole; any other inconsistency is ErrCorruptSegment.
 func Open(dir string, opts Options) (*Log, error) {
 	if opts.SegmentBytes <= 0 {
 		return nil, ErrInvalidOptions
@@ -118,31 +129,53 @@ func Open(dir string, opts Options) (*Log, error) {
 		staged:    make(map[uint64][][]byte),
 		committed: make(map[uint64][][]byte),
 	}
-	for _, n := range indices {
+	for i, n := range indices {
 		data, err := os.ReadFile(l.segmentPath(n))
 		if err != nil {
 			return nil, err
 		}
-		batches, err := parseSegment(data)
+		batches, tail, err := parseSegment(data)
 		if err != nil {
 			return nil, err
 		}
-		if len(batches) == 0 {
-			continue // empty segment, e.g. created just before a crash
+		if tail != nil && i != len(indices)-1 {
+			// A half-written tail is a crash remnant only in the
+			// last segment; anywhere else it is tampering.
+			return nil, ErrCorruptSegment
 		}
-		seg := Segment{FirstSeq: ^uint64(0)}
-		for _, pb := range batches {
-			l.committed[pb.seq] = pb.records
-			if pb.seq < seg.FirstSeq {
-				seg.FirstSeq = pb.seq
+		l.curBatches = len(batches)
+		if len(batches) > 0 {
+			seg := Segment{FirstSeq: ^uint64(0)}
+			for _, pb := range batches {
+				l.committed[pb.seq] = pb.records
+				if pb.seq < seg.FirstSeq {
+					seg.FirstSeq = pb.seq
+				}
+				if pb.seq > seg.LastSeq {
+					seg.LastSeq = pb.seq
+				}
 			}
-			if pb.seq > seg.LastSeq {
-				seg.LastSeq = pb.seq
+			l.segs = append(l.segs, seg)
+			if seg.LastSeq >= l.nextSeq {
+				l.nextSeq = seg.LastSeq + 1
 			}
 		}
-		l.segs = append(l.segs, seg)
-		if seg.LastSeq >= l.nextSeq {
-			l.nextSeq = seg.LastSeq + 1
+		if tail != nil {
+			// Drop the torn entry so later appends stay parseable, and
+			// keep its reserved sequence as a permanent hole: the
+			// crashed batch stays staged forever and its sequence is
+			// never reused.
+			if err := os.Truncate(l.segmentPath(n), int64(tail.off)); err != nil {
+				return nil, err
+			}
+			if tail.hasSeq && tail.seq > 0 {
+				if _, ok := l.committed[tail.seq]; !ok {
+					l.staged[tail.seq] = nil
+				}
+				if tail.seq >= l.nextSeq {
+					l.nextSeq = tail.seq + 1
+				}
+			}
 		}
 	}
 	if len(indices) > 0 {
@@ -171,7 +204,10 @@ func (l *Log) Append(records [][]byte) (Batch, error) {
 
 // Commit makes a staged batch durable and readable, and returns its
 // reserved sequence number. Committing a batch that is not staged —
-// including one already committed — returns ErrUnknownBatch.
+// including one already committed — returns ErrUnknownBatch. With
+// Options.Sync a returned commit is durable; if the fsync fails Commit
+// returns ErrSyncFailed and the batch stays staged, keeping its
+// reserved sequence for a retry.
 func (l *Log) Commit(b Batch) (uint64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -186,9 +222,15 @@ func (l *Log) Commit(b Batch) (uint64, error) {
 	if err := l.writeEntry(entry); err != nil {
 		return 0, err
 	}
-	var syncErr error
 	if l.opts.Sync {
-		syncErr = l.file.Sync()
+		if err := syncFile(l.file); err != nil {
+			// The batch stays staged and keeps its reserved sequence;
+			// a later Commit retries. Drop the un-synced entry so the
+			// retry cannot duplicate it on disk.
+			l.file.Truncate(int64(l.fileSize - len(entry)))
+			l.fileSize -= len(entry)
+			return 0, fmt.Errorf("%w: %v", ErrSyncFailed, err)
+		}
 	}
 	delete(l.staged, b.seq)
 	l.committed[b.seq] = recs
@@ -204,7 +246,7 @@ func (l *Log) Commit(b Batch) (uint64, error) {
 		}
 	}
 	l.curBatches++
-	return b.seq, syncErr
+	return b.seq, nil
 }
 
 // Read returns the records of the committed batch with the given

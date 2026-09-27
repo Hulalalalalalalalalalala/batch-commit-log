@@ -14,8 +14,10 @@ import (
 //	records count × (4-byte length + opaque bytes)
 //	crc32   4 bytes  IEEE checksum of everything before it
 //
-// The trailing checksum makes truncation and tampering detectable as
-// ErrCorruptSegment when the segment is parsed.
+// The trailing checksum makes tampering detectable as ErrCorruptSegment
+// when the segment is parsed. A torn write left by a crash is instead
+// reported as a tail: a strict prefix of a valid entry, never a full
+// entry with a bad checksum.
 var segmentMagic = []byte{'B', 'C', 'L', '1'}
 
 const entryHeaderLen = 4 + 8 + 4
@@ -46,30 +48,56 @@ type parsedBatch struct {
 	records [][]byte
 }
 
-// parseSegment decodes every batch entry in data. Any truncation,
-// unknown content, or checksum mismatch yields ErrCorruptSegment.
-func parseSegment(data []byte) ([]parsedBatch, error) {
+// segmentTail describes an incomplete entry at the end of a segment: the
+// remnant of a crash in the middle of a write.
+type segmentTail struct {
+	off    int    // offset where the incomplete entry starts
+	seq    uint64 // sequence reserved for the crashed batch
+	hasSeq bool   // whether the partial header held a full sequence
+}
+
+// parseSegment decodes every complete batch entry in data. A truncated
+// tail — trailing bytes that are only a prefix of an entry — is reported
+// separately as the signature of a crash mid-write. Any other
+// inconsistency (unknown magic, bad checksum) yields ErrCorruptSegment.
+func parseSegment(data []byte) ([]parsedBatch, *segmentTail, error) {
 	var batches []parsedBatch
 	off := 0
 	for off < len(data) {
-		if len(data)-off < entryHeaderLen {
-			return nil, ErrCorruptSegment
+		rest := data[off:]
+		if len(rest) < entryHeaderLen {
+			// A partial header is a torn write only if it is a
+			// prefix of a valid header.
+			n := min(len(rest), len(segmentMagic))
+			if !bytes.Equal(rest[:n], segmentMagic[:n]) {
+				return nil, nil, ErrCorruptSegment
+			}
+			tail := &segmentTail{off: off}
+			if len(rest) >= 12 {
+				tail.seq = binary.LittleEndian.Uint64(rest[4:12])
+				tail.hasSeq = true
+			}
+			return batches, tail, nil
 		}
-		if !bytes.Equal(data[off:off+4], segmentMagic) {
-			return nil, ErrCorruptSegment
+		if !bytes.Equal(rest[:4], segmentMagic) {
+			return nil, nil, ErrCorruptSegment
 		}
-		seq := binary.LittleEndian.Uint64(data[off+4 : off+12])
-		count := binary.LittleEndian.Uint32(data[off+12 : off+16])
+		seq := binary.LittleEndian.Uint64(rest[4:12])
+		count := binary.LittleEndian.Uint32(rest[12:16])
+		tail := &segmentTail{off: off, seq: seq, hasSeq: true}
 		pos := off + entryHeaderLen
 		records := make([][]byte, 0, min(int(count), 1<<20))
 		for i := uint32(0); i < count; i++ {
 			if len(data)-pos < 4 {
-				return nil, ErrCorruptSegment
+				return batches, tail, nil
 			}
 			n := int(binary.LittleEndian.Uint32(data[pos : pos+4]))
 			pos += 4
-			if n < 0 || len(data)-pos < n {
-				return nil, ErrCorruptSegment
+			if n < 0 {
+				return nil, nil, ErrCorruptSegment
+			}
+			if len(data)-pos < n {
+				return batches, tail, nil
 			}
 			rec := make([]byte, n)
 			copy(rec, data[pos:pos+n])
@@ -77,15 +105,15 @@ func parseSegment(data []byte) ([]parsedBatch, error) {
 			records = append(records, rec)
 		}
 		if len(data)-pos < 4 {
-			return nil, ErrCorruptSegment
+			return batches, tail, nil
 		}
 		crc := binary.LittleEndian.Uint32(data[pos : pos+4])
 		if crc32.ChecksumIEEE(data[off:pos]) != crc {
-			return nil, ErrCorruptSegment
+			return nil, nil, ErrCorruptSegment
 		}
 		pos += 4
 		batches = append(batches, parsedBatch{seq: seq, records: records})
 		off = pos
 	}
-	return batches, nil
+	return batches, nil, nil
 }
