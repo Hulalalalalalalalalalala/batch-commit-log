@@ -4,13 +4,19 @@
 // atomically with Commit, or publishes several staged batches atomically
 // with CommitGroup. Readers only ever see committed batches, in strictly
 // increasing sequence order starting at 1. Reads locate each batch
-// through a segment-level index that Open rebuilds from the segment
-// files, so losing the index never loses data.
+// through a persistent segment-level index in a sidecar file
+// ("index.idx"): Open adopts it incrementally, and when it is missing,
+// truncated, version-mismatched, checksum-bad or contradictory to the
+// segments, Open rebuilds it from the segment files, so losing the
+// index never loses data.
 package log
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"sort"
@@ -80,11 +86,12 @@ type Segment struct {
 }
 
 // entryRef locates one committed batch body inside a segment file. The
-// index is rebuilt from the segment files every time the log opens, so
-// its loss or invalidation is always safe. gen is the publication
-// generation of the commit that published the batch; every member of a
-// group commit shares one gen, which lets a streaming replay snapshot
-// see the whole group or none of it.
+// persistent index sidecar stores the same locations; its loss or
+// invalidation is always safe because Open rebuilds it from the
+// segments. gen is the publication generation of the commit that
+// published the batch; every member of a group commit shares one gen,
+// which lets a streaming replay snapshot see the whole group or none of
+// it.
 type entryRef struct {
 	seg    int // segment file number
 	off    int // offset of the batch body within the segment
@@ -110,6 +117,8 @@ type Log struct {
 	mu         sync.RWMutex
 	file       *os.File // current segment, nil until first write
 	fileSize   int
+	idxFile    *os.File // index sidecar, opened for append
+	idxSize    int
 	segIndex   int // index of the current segment file, 0 = none yet
 	curBatches int // committed batches in the current segment
 	nextSeq    uint64
@@ -120,13 +129,17 @@ type Log struct {
 	closed     bool
 }
 
-// Open opens the log in dir, creating the directory if needed. Existing
-// segments are validated and their committed batches become readable,
-// and the segment-level index is rebuilt from them. A half-written tail
-// of the last segment — the remnant of a crash mid-write — is replaced
-// by a durable hole marker without error and its reserved sequences stay
-// permanent holes across reopens; any other inconsistency is
-// ErrCorruptSegment.
+// Open opens the log in dir, creating the directory if needed. The
+// committed set is taken from the persistent index sidecar when it can
+// be adopted incrementally; if the sidecar is missing, truncated, from
+// another version, checksum-bad or contradictory to the segment files,
+// Open transparently rebuilds it by scanning the segments once. Either
+// path yields identical reads, replays, segment listings and errors.
+//
+// A half-written tail of the last segment — the remnant of a crash
+// mid-write — is replaced by a durable hole marker without error and
+// its reserved sequences stay permanent holes across reopens; any other
+// inconsistency is ErrCorruptSegment.
 func Open(dir string, opts Options) (*Log, error) {
 	if opts.SegmentBytes <= 0 {
 		return nil, ErrInvalidOptions
@@ -158,52 +171,94 @@ func Open(dir string, opts Options) (*Log, error) {
 		staged:  make(map[uint64][][]byte),
 		index:   make(map[uint64]entryRef),
 	}
-	for i, n := range indices {
-		data, err := os.ReadFile(l.segmentPath(n))
+
+	// Segment sizes are all the segment metadata adoption needs; the
+	// contents are touched only by the cheap CRC pass, never decoded
+	// entry by entry.
+	sizes := make(map[int]int, len(indices))
+	for _, n := range indices {
+		st, err := os.Stat(l.segmentPath(n))
 		if err != nil {
 			return nil, err
 		}
-		batches, holes, tail, err := parseSegment(data)
+		sizes[n] = int(st.Size())
+	}
+
+	snapshot, ok := l.adoptIndex(indices, sizes)
+	if !ok {
+		snapshot, err = l.rebuildFromSegments(indices)
 		if err != nil {
 			return nil, err
 		}
-		if tail != nil && i != len(indices)-1 {
-			// A half-written tail is a crash remnant only in the
-			// last segment; anywhere else it is tampering.
-			return nil, ErrCorruptSegment
+	}
+	sortIndexSnapshot(&snapshot)
+	l.installSnapshot(snapshot, indices)
+
+	if len(indices) > 0 {
+		l.segIndex = indices[len(indices)-1]
+		if err := l.openCurrent(); err != nil {
+			return nil, err
 		}
-		l.curBatches = len(batches)
-		if len(batches) > 0 {
-			seg := Segment{FirstSeq: ^uint64(0)}
-			for _, pb := range batches {
-				l.index[pb.seq] = entryRef{seg: n, off: pb.off, length: pb.length}
-				if pb.seq < seg.FirstSeq {
-					seg.FirstSeq = pb.seq
-				}
-				if pb.seq > seg.LastSeq {
-					seg.LastSeq = pb.seq
-				}
-			}
-			l.segs = append(l.segs, seg)
-			if seg.LastSeq >= l.nextSeq {
-				l.nextSeq = seg.LastSeq + 1
+	}
+	if err := l.openIndex(); err != nil {
+		return nil, err
+	}
+	return l, nil
+}
+
+// installSnapshot populates the in-memory index, segment listing, staged
+// holes and next-sequence counter from an adopted or rebuilt snapshot.
+// Both open paths funnel through here so their observable state is
+// identical. Entries must be ordered by (segment, disk offset); each
+// entry (a single commit or one group) gets one publication generation.
+func (l *Log) installSnapshot(p parsedIndex, indices []int) {
+	for i := range p.entries {
+		e := &p.entries[i]
+		l.gen++
+		for _, m := range e.members {
+			l.index[m.seq] = entryRef{seg: e.seg, off: m.off, length: m.length, gen: l.gen}
+			if m.seq >= l.nextSeq {
+				l.nextSeq = m.seq + 1
 			}
 		}
-		if tail != nil {
-			// Replace the torn entry with a durable hole marker so
-			// its reserved sequences stay permanent holes: the
-			// crashed batches stay staged forever and their
-			// sequences are never reused, even across reopens.
-			if err := l.rewriteTail(n, tail.off, tail.seqs); err != nil {
-				return nil, err
+	}
+	// Segment listing: one entry per physical segment that holds at
+	// least one committed batch.
+	segSeen := make(map[int]int)
+	for i := range p.entries {
+		e := &p.entries[i]
+		var first, last uint64
+		for j, m := range e.members {
+			if j == 0 {
+				first, last = m.seq, m.seq
 			}
-			holes = append(holes, tail.seqs...)
+			if m.seq < first {
+				first = m.seq
+			}
+			if m.seq > last {
+				last = m.seq
+			}
 		}
-		for _, seq := range holes {
+		if idx, known := segSeen[e.seg]; known {
+			if first < l.segs[idx].FirstSeq {
+				l.segs[idx].FirstSeq = first
+			}
+			if last > l.segs[idx].LastSeq {
+				l.segs[idx].LastSeq = last
+			}
+		} else {
+			segSeen[e.seg] = len(l.segs)
+			l.segs = append(l.segs, Segment{FirstSeq: first, LastSeq: last})
+		}
+	}
+	// Holes reserve sequences permanently: they read as staged (never
+	// committed) and are never reused, across any number of reopens.
+	for i := range p.holes {
+		for _, seq := range p.holes[i].seqs {
 			if seq == 0 {
 				continue
 			}
-			if _, ok := l.index[seq]; !ok {
+			if _, committed := l.index[seq]; !committed {
 				l.staged[seq] = nil
 			}
 			if seq >= l.nextSeq {
@@ -212,12 +267,513 @@ func Open(dir string, opts Options) (*Log, error) {
 		}
 	}
 	if len(indices) > 0 {
-		l.segIndex = indices[len(indices)-1]
-		if err := l.openCurrent(); err != nil {
-			return nil, err
+		last := indices[len(indices)-1]
+		l.curBatches = 0
+		for i := range p.entries {
+			if p.entries[i].seg == last {
+				l.curBatches += len(p.entries[i].members)
+			}
 		}
 	}
-	return l, nil
+}
+
+// sortIndexSnapshot orders a snapshot's records by (segment, offset),
+// the canonical on-disk and publication order.
+func sortIndexSnapshot(p *parsedIndex) {
+	sort.SliceStable(p.entries, func(i, j int) bool {
+		if p.entries[i].seg != p.entries[j].seg {
+			return p.entries[i].seg < p.entries[j].seg
+		}
+		return p.entries[i].off < p.entries[j].off
+	})
+	sort.SliceStable(p.holes, func(i, j int) bool {
+		if p.holes[i].seg != p.holes[j].seg {
+			return p.holes[i].seg < p.holes[j].seg
+		}
+		return p.holes[i].off < p.holes[j].off
+	})
+}
+
+// adoptIndex is the incremental open path. It verifies the sidecar
+// against the segment files without decoding record bodies: its records
+// must tile a prefix of the segment files from offset zero, every
+// on-disk CRC must match, and member locations must agree with the entry
+// headers. Any framing defect, a truncated final record, a version
+// mismatch or a contradiction makes it return ok=false and Open rebuilds
+// from the segments instead.
+//
+// The segments may legitimately extend past a verified index — the
+// crash window between the segment sync and the index record sync. That
+// suffix (extra bytes of the last covered segment, plus any whole later
+// segment) is parsed incrementally: complete entries get indexed, a
+// torn tail of the last segment becomes a hole marker, so adoption
+// still costs one small decode rather than a full scan.
+func (l *Log) adoptIndex(indices []int, sizes map[int]int) (parsedIndex, bool) {
+	if len(indices) == 0 {
+		// No segments: nothing to index; openIndex creates the sidecar
+		// lazily with its header when the first commit lands.
+		return parsedIndex{}, true
+	}
+	data, err := l.readIndexBytes()
+	if err != nil {
+		return parsedIndex{}, false
+	}
+	p, tailLen, err := readIndexFile(data)
+	if err != nil || tailLen > 0 {
+		// Missing/truncated/foreign sidecar: the rebuild path owns
+		// these cases.
+		return parsedIndex{}, false
+	}
+	if len(p.entries) == 0 && len(p.holes) == 0 {
+		// A recordless sidecar is valid only when every segment is
+		// empty; otherwise the sidecar is simply behind and the
+		// rebuild path catches up.
+		for _, n := range indices {
+			if sizes[n] != 0 {
+				return parsedIndex{}, false
+			}
+		}
+		return p, true
+	}
+	covered, covEnd, ok := l.verifySidecar(p, indices, sizes)
+	if !ok {
+		return parsedIndex{}, false
+	}
+
+	// Everything at or after covered is unverified suffix: the unindexed
+	// tail bytes of segment covered, then every whole later segment.
+	pos := 0
+	for pos < len(indices) && indices[pos] < covered {
+		pos++
+	}
+	var extra []diskRecord
+	for si := pos; si < len(indices); si++ {
+		n := indices[si]
+		raw, err := os.ReadFile(l.segmentPath(n))
+		if err != nil {
+			return parsedIndex{}, false
+		}
+		base := 0
+		if n == covered {
+			if covEnd > len(raw) {
+				return parsedIndex{}, false
+			}
+			base = covEnd
+		}
+		batches, markers, tail, perr := parseSegment(raw[base:])
+		if perr != nil {
+			// Tampering in the suffix surfaces through the rebuild path
+			// with the identical ErrCorruptSegment.
+			return parsedIndex{}, false
+		}
+		if tail != nil && si != len(indices)-1 {
+			return parsedIndex{}, false
+		}
+		for k := 0; k < len(batches); {
+			diskOff := batches[k].diskOff + base
+			j := k + 1
+			for j < len(batches) && batches[j].diskOff+base == diskOff {
+				j++
+			}
+			e := indexEntry{
+				seg:     n,
+				off:     diskOff,
+				length:  batches[k].diskLen,
+				diskCRC: batches[k].diskCRC,
+				members: make([]indexMember, 0, j-k),
+			}
+			for _, pb := range batches[k:j] {
+				e.members = append(e.members, indexMember{
+					seq: pb.seq, off: pb.off + base, length: pb.length,
+				})
+			}
+			p.entries = append(p.entries, e)
+			extra = append(extra, diskRecord{seg: n, off: diskOff, enc: encodeEntryRecord(e)})
+			k = j
+		}
+		for _, h := range markers {
+			ih := indexHole{
+				seg: n, off: h.off + base, length: h.length, diskCRC: h.crc,
+				seqs: append(make([]uint64, 0, len(h.seqs)), h.seqs...),
+			}
+			p.holes = append(p.holes, ih)
+			extra = append(extra, diskRecord{seg: n, off: ih.off, enc: encodeHoleRecord(ih)})
+		}
+		if tail != nil {
+			keep := make([]uint64, 0, len(tail.seqs))
+			for _, seq := range tail.seqs {
+				if seq > 0 {
+					keep = append(keep, seq)
+				}
+			}
+			if err := l.rewriteTail(n, base+tail.off, keep); err != nil {
+				return parsedIndex{}, false
+			}
+			if len(keep) > 0 {
+				marker := encodeHoles(keep)
+				crc := binary.LittleEndian.Uint32(marker[len(marker)-4:])
+				ih := indexHole{
+					seg: n, off: base + tail.off, length: len(marker), diskCRC: crc,
+					seqs: append(make([]uint64, 0, len(keep)), keep...),
+				}
+				p.holes = append(p.holes, ih)
+				extra = append(extra, diskRecord{seg: n, off: ih.off, enc: encodeHoleRecord(ih)})
+			}
+		}
+	}
+
+	// Persist the incrementally recovered records so later opens adopt
+	// them too. A crash during this append leaves a torn final index
+	// record, and the next open simply rebuilds.
+	if len(extra) > 0 {
+		if err := l.appendAdoptedSuffix(extra); err != nil {
+			return parsedIndex{}, false
+		}
+	}
+	return p, true
+}
+
+// appendAdoptedSuffix appends incrementally recovered records to the
+// sidecar and fsyncs it. Failure means the caller rebuilds instead.
+func (l *Log) appendAdoptedSuffix(recs []diskRecord) error {
+	sort.SliceStable(recs, func(i, j int) bool {
+		if recs[i].seg != recs[j].seg {
+			return recs[i].seg < recs[j].seg
+		}
+		return recs[i].off < recs[j].off
+	})
+	f, err := os.OpenFile(l.indexPath(), os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	for _, r := range recs {
+		if _, err := f.Write(r.enc); err != nil {
+			return err
+		}
+	}
+	return f.Sync()
+}
+
+// sidecarRec is one physical record the index claims.
+type sidecarRec struct {
+	seg    int
+	off    int
+	length int
+	crc    uint32
+	entry  *indexEntry
+	hole   *indexHole
+}
+
+// verifySidecar checks an already-framed parse against the physical
+// segments without decoding any record body. It returns the last segment
+// the index covers and the offset immediately after its records there.
+//
+// The covered segments must be a prefix of the segment files in the
+// directory; within each one records must be strictly ordered, start at
+// offset zero and tile without gaps or overlap. Every covered segment
+// except the last must end exactly at the file size (nothing
+// unindexed); the last one may stop short, leaving a suffix for
+// incremental parsing. Every stored disk CRC is recomputed, and entry
+// headers (magic and group membership layout) are checked.
+func (l *Log) verifySidecar(p parsedIndex, indices []int, sizes map[int]int) (coveredSeg int, coveredEnd int, ok bool) {
+	if len(indices) == 0 {
+		return 0, 0, false
+	}
+	recs := make([]sidecarRec, 0, len(p.entries)+len(p.holes))
+	for i := range p.entries {
+		e := &p.entries[i]
+		recs = append(recs, sidecarRec{seg: e.seg, off: e.off, length: e.length, crc: e.diskCRC, entry: e})
+	}
+	for i := range p.holes {
+		h := &p.holes[i]
+		recs = append(recs, sidecarRec{seg: h.seg, off: h.off, length: h.length, crc: h.diskCRC, hole: h})
+	}
+	sort.SliceStable(recs, func(i, j int) bool {
+		if recs[i].seg != recs[j].seg {
+			return recs[i].seg < recs[j].seg
+		}
+		return recs[i].off < recs[j].off
+	})
+
+	known := make(map[int]bool, len(indices))
+	for _, n := range indices {
+		known[n] = true
+	}
+	covered := false
+	seenSeq := make(map[uint64]bool)
+	var f *os.File
+	openSeg := -1
+	closeFile := func() {
+		if f != nil {
+			f.Close()
+			f = nil
+			openSeg = -1
+		}
+	}
+	defer closeFile()
+
+	prevSeg, prevEnd := -1, 0
+	for i := range recs {
+		r := &recs[i]
+		if !known[r.seg] || r.off < 0 || r.length < 16 {
+			return 0, 0, false
+		}
+		if r.seg != prevSeg {
+			// A new covered segment: the previous one must be tiled to
+			// its EOF, and the covered segments must be a prefix with no
+			// unindexed segment file in between.
+			if prevSeg != -1 && prevEnd != sizes[prevSeg] {
+				return 0, 0, false
+			}
+			if covered {
+				next := 0
+				found := false
+				for _, n := range indices {
+					if n > prevSeg {
+						next, found = n, true
+						break
+					}
+				}
+				if !found || r.seg != next || r.off != 0 {
+					return 0, 0, false
+				}
+			} else {
+				if r.seg != indices[0] || r.off != 0 {
+					return 0, 0, false
+				}
+			}
+			covered = true
+			prevSeg = r.seg
+			prevEnd = 0
+			closeFile()
+			var err error
+			f, err = os.Open(l.segmentPath(r.seg))
+			if err != nil {
+				return 0, 0, false
+			}
+			openSeg = r.seg
+		}
+		if openSeg != r.seg || r.off != prevEnd || r.off+r.length > sizes[r.seg] {
+			return 0, 0, false
+		}
+		if !l.verifyDiskRecord(f, r, seenSeq) {
+			return 0, 0, false
+		}
+		prevEnd = r.off + r.length
+	}
+	lastSeg := recs[len(recs)-1].seg
+	lastEnd := prevEnd
+
+	// Every segment file before the last covered one must carry at
+	// least one index record (no unindexed segment in the middle).
+	refSegs := map[int]bool{}
+	for i := range recs {
+		refSegs[recs[i].seg] = true
+	}
+	for _, n := range indices {
+		if n < lastSeg && !refSegs[n] {
+			return 0, 0, false
+		}
+	}
+	return lastSeg, lastEnd, true
+}
+
+// verifyDiskRecord checks one index claim against the segment without
+// holding the entry in memory: a small header read, a streaming CRC over
+// a fixed-size scratch buffer, and 8-byte reads of group-member
+// sequences. It never decodes record bodies.
+func (l *Log) verifyDiskRecord(f *os.File, r *sidecarRec, seenSeq map[uint64]bool) bool {
+	var hdr [16]byte
+	if _, err := f.ReadAt(hdr[:12], int64(r.off)); err != nil {
+		return false
+	}
+	// Stream the entry's CRC-covered prefix through one reused buffer,
+	// then compare against the stored trailing checksum.
+	h := crc32.NewIEEE()
+	buf := make([]byte, 64*1024)
+	remaining := r.length - 4
+	at := int64(r.off)
+	for remaining > 0 {
+		n := len(buf)
+		if n > remaining {
+			n = remaining
+		}
+		if _, err := f.ReadAt(buf[:n], at); err != nil {
+			return false
+		}
+		h.Write(buf[:n])
+		remaining -= n
+		at += int64(n)
+	}
+	var crcBytes [4]byte
+	if _, err := f.ReadAt(crcBytes[:], at); err != nil {
+		return false
+	}
+	stored := binary.LittleEndian.Uint32(crcBytes[:])
+	if h.Sum32() != stored || stored != r.crc {
+		return false
+	}
+
+	switch {
+	case r.entry != nil:
+		e := r.entry
+		switch {
+		case bytes.Equal(hdr[:4], segmentMagic):
+			return len(e.members) == 1 &&
+				e.members[0].seq == binary.LittleEndian.Uint64(hdr[4:12]) &&
+				e.members[0].off == r.off+4 &&
+				e.members[0].length == r.length-8 &&
+				markSeen(e.members, seenSeq)
+		case bytes.Equal(hdr[:4], groupMagic):
+			if uint32(len(e.members)) != binary.LittleEndian.Uint32(hdr[4:8]) {
+				return false
+			}
+			bodyStart := r.off + 8
+			for i, m := range e.members {
+				rel := m.off - r.off
+				if m.length <= 0 || rel < 8 || rel+m.length > r.length-4 {
+					return false
+				}
+				if i == 0 {
+					if m.off != bodyStart {
+						return false
+					}
+				} else {
+					prev := e.members[i-1]
+					if m.off != prev.off+prev.length {
+						return false
+					}
+				}
+				if i == len(e.members)-1 && m.off+m.length != r.off+r.length-4 {
+					return false
+				}
+				var seqBytes [8]byte
+				if _, err := f.ReadAt(seqBytes[:], int64(m.off)); err != nil {
+					return false
+				}
+				if m.seq != binary.LittleEndian.Uint64(seqBytes[:]) {
+					return false
+				}
+			}
+			return markSeen(e.members, seenSeq)
+		default:
+			return false
+		}
+	case r.hole != nil:
+		h2 := r.hole
+		if !bytes.Equal(hdr[:4], holeMagic) ||
+			uint32(len(h2.seqs)) != binary.LittleEndian.Uint32(hdr[4:8]) ||
+			r.length != 4+4+8*len(h2.seqs)+4 {
+			return false
+		}
+		// The reserved sequences themselves must agree with the marker,
+		// not just their count.
+		seqBytes := make([]byte, 8*len(h2.seqs))
+		if len(seqBytes) > 0 {
+			if _, err := f.ReadAt(seqBytes, int64(r.off+8)); err != nil {
+				return false
+			}
+			for i, seq := range h2.seqs {
+				if seq == 0 || seenSeq[seq] ||
+					seq != binary.LittleEndian.Uint64(seqBytes[8*i:8*i+8]) {
+					return false
+				}
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+// markSeen records every member sequence, rejecting 0 and duplicates.
+func markSeen(members []indexMember, seen map[uint64]bool) bool {
+	for _, m := range members {
+		if m.seq == 0 || seen[m.seq] {
+			return false
+		}
+		seen[m.seq] = true
+	}
+	return true
+}
+
+// rebuildFromSegments is the fallback open path: it decodes every
+// segment exactly as a historical open did, recovers a torn tail of the
+// last segment into a durable hole marker, and finally persists a fresh
+// index snapshot. Tampering anywhere but the last segment's tail stays
+// ErrCorruptSegment.
+func (l *Log) rebuildFromSegments(indices []int) (parsedIndex, error) {
+	var p parsedIndex
+	for i, n := range indices {
+		data, err := os.ReadFile(l.segmentPath(n))
+		if err != nil {
+			return parsedIndex{}, err
+		}
+		batches, markers, tail, err := parseSegment(data)
+		if err != nil {
+			return parsedIndex{}, err
+		}
+		if tail != nil && i != len(indices)-1 {
+			// A half-written tail is a crash remnant only in the last
+			// segment; anywhere else it is tampering.
+			return parsedIndex{}, ErrCorruptSegment
+		}
+		for k := 0; k < len(batches); {
+			// Members of one group entry share diskOff; a single commit
+			// is an entry with one member.
+			diskOff := batches[k].diskOff
+			j := k + 1
+			for j < len(batches) && batches[j].diskOff == diskOff {
+				j++
+			}
+			e := indexEntry{
+				seg:     n,
+				off:     batches[k].diskOff,
+				length:  batches[k].diskLen,
+				diskCRC: batches[k].diskCRC,
+				members: make([]indexMember, 0, j-k),
+			}
+			for _, pb := range batches[k:j] {
+				e.members = append(e.members, indexMember{seq: pb.seq, off: pb.off, length: pb.length})
+			}
+			p.entries = append(p.entries, e)
+			k = j
+		}
+		for _, h := range markers {
+			p.holes = append(p.holes, indexHole{
+				seg: n, off: h.off, length: h.length, diskCRC: h.crc,
+				seqs: append(make([]uint64, 0, len(h.seqs)), h.seqs...),
+			})
+		}
+		if tail != nil {
+			// Replace the torn entry with a durable hole marker so its
+			// reserved sequences stay permanent holes, then index the
+			// replacement marker as part of the fresh snapshot.
+			keep := make([]uint64, 0, len(tail.seqs))
+			for _, seq := range tail.seqs {
+				if seq > 0 {
+					keep = append(keep, seq)
+				}
+			}
+			if err := l.rewriteTail(n, tail.off, keep); err != nil {
+				return parsedIndex{}, err
+			}
+			if len(keep) > 0 {
+				marker := encodeHoles(keep)
+				crc := binary.LittleEndian.Uint32(marker[len(marker)-4:])
+				p.holes = append(p.holes, indexHole{
+					seg: n, off: tail.off, length: len(marker), diskCRC: crc,
+					seqs: append(make([]uint64, 0, len(keep)), keep...),
+				})
+			}
+		}
+	}
+	sortIndexSnapshot(&p)
+	if err := l.writeIndexSnapshot(p); err != nil {
+		return parsedIndex{}, err
+	}
+	return p, nil
 }
 
 // Append stages a batch of records and reserves the next sequence number
@@ -238,9 +794,11 @@ func (l *Log) Append(records [][]byte) (Batch, error) {
 // Commit makes a staged batch durable and readable, and returns its
 // reserved sequence number. Committing a batch that is not staged —
 // including one already committed — returns ErrUnknownBatch. With
-// Options.Sync a returned commit is durable; if the fsync fails Commit
-// returns ErrSyncFailed and the batch stays staged, keeping its
-// reserved sequence for a retry.
+// Options.Sync a returned commit is durable: the segment entry and the
+// index sidecar record are both synced, one fsync each. If either
+// fsync fails Commit returns ErrSyncFailed, rolls both files back and
+// the batch stays staged, keeping its reserved sequence for a retry
+// that cannot produce a duplicate entry.
 func (l *Log) Commit(b Batch) (uint64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -252,6 +810,7 @@ func (l *Log) Commit(b Batch) (uint64, error) {
 		return 0, ErrUnknownBatch
 	}
 	entry := encodeBatch(b.seq, recs)
+	idxBefore := l.idxSize
 	off, err := l.writeEntry(entry)
 	if err != nil {
 		return 0, err
@@ -261,10 +820,26 @@ func (l *Log) Commit(b Batch) (uint64, error) {
 			// The batch stays staged and keeps its reserved sequence;
 			// a later Commit retries. Drop the un-synced entry so the
 			// retry cannot duplicate it on disk.
-			l.file.Truncate(int64(off))
-			l.fileSize = off
+			l.rollbackEntry(off, idxBefore)
 			return 0, fmt.Errorf("%w: %v", ErrSyncFailed, err)
 		}
+	}
+	rec := encodeEntryRecord(indexEntry{
+		seg:     l.segIndex,
+		off:     off,
+		length:  len(entry),
+		diskCRC: binary.LittleEndian.Uint32(entry[len(entry)-4:]),
+		members: []indexMember{{
+			seq: b.seq, off: off + len(segmentMagic),
+			length: len(entry) - len(segmentMagic) - 4,
+		}},
+	})
+	if err := l.appendIndexRecord(rec); err != nil {
+		// Index write/fsync failed: the commit is not published. Roll
+		// the index record and the segment entry both back so a retry
+		// republishes exactly once.
+		l.rollbackEntry(off, idxBefore)
+		return 0, err
 	}
 	delete(l.staged, b.seq)
 	l.gen++
@@ -274,17 +849,18 @@ func (l *Log) Commit(b Batch) (uint64, error) {
 }
 
 // CommitGroup makes several staged batches durable and readable as one
-// atomic unit: a single write and, with Options.Sync, a single fsync
-// covering the whole group. Each batch keeps the sequence it reserved at
-// Append, and the batches become visible in that reserved order — the
-// merge never reorders them. If any batch is not staged — including one
-// already committed — nothing is written and the error is
-// ErrUnknownBatch. If the fsync fails, the written bytes are rolled back
-// and every batch stays staged with its reserved sequence; the error is
-// ErrSyncFailed and retrying the group commits it without duplicating
-// entries. A crash can never leave half of the group visible: the group
-// is either wholly durable or wholly staged, and sequences reserved by a
-// torn group stay permanent holes.
+// atomic unit: a single segment write and, with Options.Sync, a single
+// segment fsync covering the whole group, followed by one index record
+// synced once. Each batch keeps the sequence it reserved at Append, and
+// the batches become visible in that reserved order — the merge never
+// reorders them. If any batch is not staged — including one already
+// committed — nothing is written and the error is ErrUnknownBatch. If
+// either fsync fails, the segment entry and the index record are rolled
+// back and every batch stays staged with its reserved sequence; the
+// error is ErrSyncFailed and retrying the group commits it without
+// duplicating entries. A crash can never leave half of the group
+// visible: the group is either wholly durable or wholly staged, and
+// sequences reserved by a torn group stay permanent holes.
 func (l *Log) CommitGroup(batches []Batch) ([]uint64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -310,19 +886,36 @@ func (l *Log) CommitGroup(batches []Batch) ([]uint64, error) {
 		seqs[i] = b.seq
 	}
 	entry, offs, lens := encodeGroup(members)
+	idxBefore := l.idxSize
 	base, err := l.writeEntry(entry)
 	if err != nil {
 		return nil, err
 	}
 	if l.opts.Sync {
 		if err := syncFile(l.file); err != nil {
-			// Every batch stays staged and keeps its reserved
-			// sequence; a later CommitGroup retries. Drop the
-			// un-synced group entry so the retry cannot duplicate it.
-			l.file.Truncate(int64(base))
-			l.fileSize = base
+			// Every batch stays staged and keeps its reserved sequence;
+			// a later CommitGroup retries. Drop the un-synced group
+			// entry so the retry cannot duplicate it.
+			l.rollbackEntry(base, idxBefore)
 			return nil, fmt.Errorf("%w: %v", ErrSyncFailed, err)
 		}
+	}
+	imembers := make([]indexMember, len(members))
+	for i, m := range members {
+		imembers[i] = indexMember{seq: m.seq, off: base + offs[i], length: lens[i]}
+	}
+	rec := encodeEntryRecord(indexEntry{
+		seg:     l.segIndex,
+		off:     base,
+		length:  len(entry),
+		diskCRC: binary.LittleEndian.Uint32(entry[len(entry)-4:]),
+		members: imembers,
+	})
+	if err := l.appendIndexRecord(rec); err != nil {
+		// The index never advertises a batch whose commit failed: roll
+		// both files back and leave the whole group staged for retry.
+		l.rollbackEntry(base, idxBefore)
+		return nil, err
 	}
 	first, last := seqs[0], seqs[0]
 	l.gen++
@@ -436,8 +1029,8 @@ func (l *Log) Segments() []Segment {
 	return out
 }
 
-// Close closes the current segment file. The log must not be used
-// afterwards.
+// Close closes the current segment file and the index sidecar. The log
+// must not be used afterwards.
 func (l *Log) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -445,10 +1038,16 @@ func (l *Log) Close() error {
 		return nil
 	}
 	l.closed = true
+	var err error
 	if l.file != nil {
-		return l.file.Close()
+		err = l.file.Close()
 	}
-	return nil
+	if l.idxFile != nil {
+		if ierr := l.idxFile.Close(); err == nil {
+			err = ierr
+		}
+	}
+	return err
 }
 
 // readRef loads the records of a committed batch straight from its
@@ -495,6 +1094,18 @@ func (l *Log) commitSpan(first, last uint64, n int) {
 		}
 	}
 	l.curBatches += n
+}
+
+// rollbackEntry undoes a commit that failed after its segment entry was
+// written: the segment file is truncated back to segOff and the just
+// appended index sidecar record back to idxSize. The batches involved
+// remain staged and a retry writes each entry exactly once.
+func (l *Log) rollbackEntry(segOff, idxSize int) {
+	if l.file != nil {
+		l.file.Truncate(int64(segOff))
+		l.fileSize = segOff
+	}
+	l.truncateIndex(idxSize)
 }
 
 // rewriteTail drops a torn tail from segment n and, when the torn entry
@@ -576,6 +1187,26 @@ func (l *Log) openCurrent() error {
 
 func (l *Log) segmentPath(index int) string {
 	return filepath.Join(l.dir, fmt.Sprintf("%06d.seg", index))
+}
+
+// indexPath is the persistent index sidecar, one file per log directory.
+func (l *Log) indexPath() string {
+	return filepath.Join(l.dir, "index.idx")
+}
+
+// syncDir fsyncs the log directory so a freshly renamed sidecar (or
+// created segment file) is durable itself. Best effort on filesystems
+// that cannot fsync directories.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	err = d.Sync()
+	if cerr := d.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 func copyRecords(records [][]byte) [][]byte {

@@ -147,6 +147,20 @@ type parsedBatch struct {
 	records [][]byte
 	off     int // offset of the batch body within the segment
 	length  int // length of the batch body
+	// diskOff/diskLen/diskCRC describe the whole entry on disk (magic
+	// through trailing checksum) and the checksum it stores. The index
+	// sidecar records them so adoption can re-verify an entry against
+	// the segment without decoding any of its records.
+	diskOff int
+	diskLen int
+	diskCRC uint32
+}
+
+type parsedHole struct {
+	off    int // offset of the marker's magic within the segment
+	length int // total length of the marker on disk, including its CRC
+	crc    uint32
+	seqs   []uint64
 }
 
 // segmentTail describes an incomplete entry at the end of a segment: the
@@ -158,15 +172,15 @@ type segmentTail struct {
 
 // parseSegment decodes every complete entry in data, returning the
 // committed batches (with the offsets of their bodies, for the index)
-// and the sequences reserved by hole markers. A truncated tail —
-// trailing bytes that are only a prefix of an entry — is reported
-// separately as the signature of a crash mid-write, along with every
-// sequence the torn entry had already reserved. Any other inconsistency
-// (unknown magic, bad checksum) yields ErrCorruptSegment.
-func parseSegment(data []byte) ([]parsedBatch, []uint64, *segmentTail, error) {
+// and the durable hole markers. A truncated tail — trailing bytes that
+// are only a prefix of an entry — is reported separately as the
+// signature of a crash mid-write, along with every sequence the torn
+// entry had already reserved. Any other inconsistency (unknown magic,
+// bad checksum) yields ErrCorruptSegment.
+func parseSegment(data []byte) ([]parsedBatch, []parsedHole, *segmentTail, error) {
 	var batches []parsedBatch
-	var holes []uint64
-	off := 0
+	var holes []parsedHole
+	var off int
 	for off < len(data) {
 		rest := data[off:]
 		if len(rest) < len(segmentMagic) {
@@ -201,7 +215,11 @@ func parseSegment(data []byte) ([]parsedBatch, []uint64, *segmentTail, error) {
 			if crc32.ChecksumIEEE(data[off:pos]) != crc {
 				return nil, nil, nil, ErrCorruptSegment
 			}
-			batches = append(batches, parsedBatch{seq: seq, records: records, off: off + 4, length: pos - off - 4})
+			batches = append(batches, parsedBatch{
+				seq: seq, records: records,
+				off: off + 4, length: pos - off - 4,
+				diskOff: off, diskLen: pos + 4 - off, diskCRC: crc,
+			})
 			off = pos + 4
 		case bytes.Equal(rest[:4], groupMagic):
 			tail := &segmentTail{off: off}
@@ -240,7 +258,10 @@ func parseSegment(data []byte) ([]parsedBatch, []uint64, *segmentTail, error) {
 			}
 			// Only a complete, checksummed group publishes its
 			// members; a torn group above publishes none.
-			batches = append(batches, members...)
+			for _, mb := range members {
+				mb.diskOff, mb.diskLen, mb.diskCRC = off, pos+4-off, crc
+				batches = append(batches, mb)
+			}
 			off = pos + 4
 		case bytes.Equal(rest[:4], holeMagic):
 			tail := &segmentTail{off: off}
@@ -266,7 +287,10 @@ func parseSegment(data []byte) ([]parsedBatch, []uint64, *segmentTail, error) {
 			if crc32.ChecksumIEEE(data[off:pos]) != crc {
 				return nil, nil, nil, ErrCorruptSegment
 			}
-			holes = append(holes, seqs...)
+			holes = append(holes, parsedHole{
+				off: off, length: pos + 4 - off, crc: crc,
+				seqs: append(make([]uint64, 0, len(seqs)), seqs...),
+			})
 			off = pos + 4
 		default:
 			return nil, nil, nil, ErrCorruptSegment
