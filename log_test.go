@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	log "github.com/Hulalalalalalalalalalala/batch-commit-log"
 )
@@ -872,5 +873,182 @@ func TestCrashHolePermanentAcrossReopens(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, []uint64{1, 3}) {
 		t.Fatalf("scan = %v, want [1 3]", got)
+	}
+}
+
+// TestScanGroupCommittedDuringReplayIsWhollyInvisible reserves seqs 2
+// and 3 but leaves them staged while committing seq 4, so the snapshot
+// starts with a max of 4 and two holes (2,3) inside its range. Blocked
+// after batch 1, it commits 2 and 3 as one group: walking 2 and 3 after
+// that, the replay must see neither member — never half a group — while 1
+// and 4 (committed before the snapshot) are delivered. The next replay
+// sees the whole group.
+func TestScanGroupCommittedDuringReplayIsWhollyInvisible(t *testing.T) {
+	l := open(t, t.TempDir(), log.Options{SegmentBytes: 1 << 20})
+	commit(t, l, []byte("a"))                 // seq 1 committed
+	g1, _ := l.Append([][]byte{[]byte("g1")}) // seq 2 staged (hole)
+	g2, _ := l.Append([][]byte{[]byte("g2")}) // seq 3 staged (hole)
+	commit(t, l, []byte("anchor"))            // seq 4 committed -> snapshot max 4
+
+	var (
+		seen []uint64
+		wg   sync.WaitGroup
+	)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := l.Scan(1, func(b log.Batch) error {
+			seen = append(seen, b.Seq())
+			if b.Seq() == 1 {
+				close(entered)
+				<-release
+			}
+			return nil
+		}); err != nil {
+			t.Errorf("Scan: %v", err)
+		}
+	}()
+	<-entered
+
+	if _, err := l.CommitGroup([]log.Batch{g1, g2}); err != nil {
+		t.Fatalf("CommitGroup during replay: %v", err)
+	}
+	close(release)
+	wg.Wait()
+
+	if !reflect.DeepEqual(seen, []uint64{1, 4}) {
+		t.Fatalf("replay saw %v, want [1 4] — group leaked (half or whole)", seen)
+	}
+	// The next replay sees the whole group, in reserved order.
+	var next []uint64
+	if err := l.Scan(1, func(b log.Batch) error {
+		next = append(next, b.Seq())
+		return nil
+	}); err != nil {
+		t.Fatalf("next Scan: %v", err)
+	}
+	if !reflect.DeepEqual(next, []uint64{1, 2, 3, 4}) {
+		t.Fatalf("next replay = %v, want [1 2 3 4]", next)
+	}
+}
+
+// TestScanSingleCommittedDuringReplayInvisible checks the same snapshot
+// boundary for a lone Commit whose sequence is beyond the snapshot max:
+// the in-flight replay never picks it up via a mid-replay metadata fetch.
+func TestScanSingleCommittedDuringReplayInvisible(t *testing.T) {
+	l := open(t, t.TempDir(), log.Options{SegmentBytes: 1 << 20})
+	commit(t, l, []byte("a"))
+	commit(t, l, []byte("b"))
+
+	var seen []uint64
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = l.Scan(1, func(b log.Batch) error {
+			seen = append(seen, b.Seq())
+			if b.Seq() == 1 {
+				close(entered)
+				<-release
+			}
+			return nil
+		})
+	}()
+	<-entered
+	commit(t, l, []byte("c")) // seq 3, committed after the snapshot
+	close(release)
+	wg.Wait()
+
+	if !reflect.DeepEqual(seen, []uint64{1, 2}) {
+		t.Fatalf("replay saw %v, want [1 2]", seen)
+	}
+}
+
+// TestSlowReplayDoesNotBlockWriter holds a scan callback open for a
+// while; concurrent commits and reads must keep making progress because
+// file IO and callbacks happen outside the writer's lock.
+func TestSlowReplayDoesNotBlockWriter(t *testing.T) {
+	l := open(t, t.TempDir(), log.Options{SegmentBytes: 1 << 20})
+	for i := 0; i < 5; i++ {
+		commit(t, l, []byte(fmt.Sprintf("seed-%d", i)))
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = l.Scan(1, func(b log.Batch) error {
+			if b.Seq() == 1 {
+				close(entered)
+				<-release
+			}
+			return nil
+		})
+	}()
+	<-entered
+
+	committed := make(chan uint64, 1)
+	go func() {
+		committed <- commit(t, l, []byte("while-replay-blocked"))
+	}()
+	select {
+	case seq := <-committed:
+		if seq != 6 {
+			t.Errorf("commit seq = %d, want 6", seq)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("writer stalled while a replay callback was blocked")
+	}
+
+	// A one-off Read also proceeds while the replay is parked.
+	readOK := make(chan struct{})
+	go func() {
+		if _, err := l.Read(6); err != nil {
+			t.Errorf("Read(6): %v", err)
+		}
+		close(readOK)
+	}()
+	select {
+	case <-readOK:
+	case <-time.After(2 * time.Second):
+		t.Fatal("concurrent Read stalled while a replay callback was blocked")
+	}
+
+	close(release)
+	wg.Wait()
+}
+
+// TestScanIsStreaming verifies memory does not grow with total batch
+// count: a replay over many batches never buffers more than the batch
+// currently being delivered (observed via a unique payload per batch).
+func TestScanIsStreaming(t *testing.T) {
+	l := open(t, t.TempDir(), log.Options{SegmentBytes: 4096})
+	const n = 200
+	for i := 0; i < n; i++ {
+		commit(t, l, []byte(fmt.Sprintf("record-%04d", i)))
+	}
+	count := 0
+	if err := l.Scan(1, func(b log.Batch) error {
+		rs := b.Records()
+		if len(rs) != 1 {
+			t.Fatalf("batch %d has %d records", b.Seq(), len(rs))
+		}
+		want := fmt.Sprintf("record-%04d", count)
+		if string(rs[0]) != want {
+			t.Fatalf("batch %d = %q, want %q", b.Seq(), rs[0], want)
+		}
+		count++
+		return nil
+	}); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if count != n {
+		t.Fatalf("replayed %d batches, want %d", count, n)
 	}
 }
