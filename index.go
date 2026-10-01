@@ -1,6 +1,7 @@
 package log
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"unicode/utf8"
 )
 
 // The segment-level index lives in a sidecar file ("index.idx") next to
@@ -29,15 +31,21 @@ import (
 //	    8 bytes length of the whole entry on disk (magic ... crc)
 //	    4 bytes disk entry CRC (the checksum stored by the segment)
 //	    4 bytes member count m
-//	    m × (8-byte seq, 8-byte body offset, 4-byte body length)
+//	    1 byte  flags (bit 0: entry uses keyed framing — BCLI/BCLK)
+//	    m × (8-byte seq, 8-byte body offset, 4-byte body length,
+//	         2-byte key length, key bytes; key length 0 = anonymous)
 //
-//	  hole marker ("H"):
-//	    8 bytes segment file number
-//	    8 bytes offset of the marker's segment magic
-//	    8 bytes length of the whole marker on disk
-//	    4 bytes disk marker CRC
-//	    4 bytes sequence count c
-//	    c × 8-byte sequence
+// Version 1 sidecars (no flags byte and no key fields) are not
+// interpreted: a version mismatch triggers the ordinary one-time rebuild
+// from the segment files, exactly like any other invalid sidecar.
+//
+//	hole marker ("H"):
+//	  8 bytes segment file number
+//	  8 bytes offset of the marker's segment magic
+//	  8 bytes length of the whole marker on disk
+//	  4 bytes disk marker CRC
+//	  4 bytes sequence count c
+//	  c × 8-byte sequence
 //
 // Every record is framed as: 1-byte type, 4-byte body length, body,
 // 4-byte CRC32 of type+length+body. A torn final record — the remnant
@@ -49,10 +57,15 @@ import (
 // layout and every disk CRC before trusting it.
 var (
 	indexMagic   = []byte{'B', 'C', 'L', 'I', 'D', 'X'}
-	indexVersion = uint16(1)
+	indexVersion = uint16(2)
 
 	recEntry = byte('E')
 	recHole  = byte('H')
+
+	// entryFlagKeyed marks an E record whose segment entry uses keyed
+	// framing (BCLI for a lone keyed commit, BCLK for a group containing
+	// at least one keyed member).
+	entryFlagKeyed = byte(1)
 )
 
 // indexEntry is one committed segment entry: either a single batch or a
@@ -62,13 +75,15 @@ type indexEntry struct {
 	off     int // offset of the entry's segment magic
 	length  int // total length of the entry on disk, including its CRC
 	diskCRC uint32
+	keyed   bool // segment entry is BCLI/BCLK rather than BCL1/BCLG
 	members []indexMember
 }
 
 type indexMember struct {
 	seq    uint64
-	off    int // body offset within the segment file
-	length int // body length
+	id     string // idempotency key, "" for an anonymous member
+	off    int    // body offset within the segment file
+	length int    // body length
 }
 
 // indexHole is one durable BCLH marker on disk.
@@ -129,7 +144,8 @@ func readIndexFile(data []byte) (p parsedIndex, tailLen int, err error) {
 		bp := 0
 		switch kind {
 		case recEntry:
-			if bodyLen < 8+8+8+4+4 {
+			const fixed = 8 + 8 + 8 + 4 + 4 + 1
+			if bodyLen < fixed {
 				return parsedIndex{}, 0, errIndexInvalid
 			}
 			e := indexEntry{}
@@ -143,18 +159,46 @@ func readIndexFile(data []byte) (p parsedIndex, tailLen int, err error) {
 			bp += 4
 			m := int(binary.LittleEndian.Uint32(body[bp : bp+4]))
 			bp += 4
-			if m <= 0 || 20*m != bodyLen-bp || 20*m < 0 {
+			flags := body[bp]
+			bp++
+			if flags & ^entryFlagKeyed != 0 {
+				return parsedIndex{}, 0, errIndexInvalid
+			}
+			e.keyed = flags&entryFlagKeyed != 0
+			if m <= 0 {
 				return parsedIndex{}, 0, errIndexInvalid
 			}
 			e.members = make([]indexMember, m)
 			for i := 0; i < m; i++ {
-				mb := body[bp : bp+20]
-				e.members[i] = indexMember{
-					seq:    binary.LittleEndian.Uint64(mb[0:8]),
-					off:    int(binary.LittleEndian.Uint64(mb[8:16])),
-					length: int(binary.LittleEndian.Uint32(mb[16:20])),
+				if bodyLen-bp < 8+8+4+2 {
+					return parsedIndex{}, 0, errIndexInvalid
+				}
+				mb := indexMember{
+					seq:    binary.LittleEndian.Uint64(body[bp : bp+8]),
+					off:    int(binary.LittleEndian.Uint64(body[bp+8 : bp+16])),
+					length: int(binary.LittleEndian.Uint32(body[bp+16 : bp+20])),
 				}
 				bp += 20
+				klen := int(binary.LittleEndian.Uint16(body[bp : bp+2]))
+				bp += 2
+				if !e.keyed && klen != 0 {
+					return parsedIndex{}, 0, errIndexInvalid
+				}
+				if klen < 0 || klen > maxBatchIDLen || bodyLen-bp < klen {
+					return parsedIndex{}, 0, errIndexInvalid
+				}
+				if klen > 0 {
+					raw := body[bp : bp+klen]
+					if bytes.IndexByte(raw, 0) >= 0 || !utf8.Valid(raw) {
+						return parsedIndex{}, 0, errIndexInvalid
+					}
+					mb.id = string(raw)
+					bp += klen
+				}
+				e.members[i] = mb
+			}
+			if bp != bodyLen {
+				return parsedIndex{}, 0, errIndexInvalid
 			}
 			if e.seg <= 0 || e.off < 0 || e.length <= 0 {
 				return parsedIndex{}, 0, errIndexInvalid
@@ -221,7 +265,11 @@ func putIndexU64(body *[]byte, tmp *[8]byte, v uint64) {
 
 // encodeEntryRecord encodes one committed segment entry and its members.
 func encodeEntryRecord(e indexEntry) []byte {
-	body := make([]byte, 0, 8+8+8+4+4+20*len(e.members))
+	size := 8 + 8 + 8 + 4 + 4 + 1
+	for _, m := range e.members {
+		size += 8 + 8 + 4 + 2 + len(m.id)
+	}
+	body := make([]byte, 0, size)
 	var tmp [8]byte
 	putIndexU64(&body, &tmp, uint64(e.seg))
 	putIndexU64(&body, &tmp, uint64(e.off))
@@ -230,11 +278,19 @@ func encodeEntryRecord(e indexEntry) []byte {
 	body = append(body, tmp[:4]...)
 	binary.LittleEndian.PutUint32(tmp[:4], uint32(len(e.members)))
 	body = append(body, tmp[:4]...)
+	flags := byte(0)
+	if e.keyed {
+		flags = entryFlagKeyed
+	}
+	body = append(body, flags)
 	for _, m := range e.members {
 		putIndexU64(&body, &tmp, m.seq)
 		putIndexU64(&body, &tmp, uint64(m.off))
 		binary.LittleEndian.PutUint32(tmp[:4], uint32(m.length))
 		body = append(body, tmp[:4]...)
+		binary.LittleEndian.PutUint16(tmp[:2], uint16(len(m.id)))
+		body = append(body, tmp[:2]...)
+		body = append(body, m.id...)
 	}
 	return finishIndexRecord(recEntry, body)
 }
