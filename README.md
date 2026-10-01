@@ -19,11 +19,12 @@ Go 1.22 or newer. Standard library only.
 - `Batch.ID() string` returns the idempotency key for a batch from `AppendIdempotent`, or `""` for an anonymous batch; batches handed to `Scan` report the same ID and records the segment stored.
 - `(*Log).Commit(batch Batch) (uint64, error)` makes a batch durable and returns its sequence. The segment entry is synced first, then one index sidecar record; with `Sync`, a failed fsync of either returns `ErrSyncFailed`, both files roll back and the batch stays staged for a retry that never duplicates the entry. Committing the batch returned by a post-commit idempotent retry returns `ErrUnknownBatch` (the original batch is already committed).
 - `(*Log).CommitGroup(batches []Batch) ([]uint64, error)` commits several staged batches as one atomic write and one fsync: all become durable together, or all stay staged for a retry. Groups may mix anonymous and keyed batches; each batch keeps its reserved sequence, and a crash never leaves half the group visible.
-- `(*Log).Read(seq uint64) ([][]byte, error)` returns one committed batch, located directly through the persistent segment-level index (adopted from `index.idx` or rebuilt from the segment files on open).
-- `(*Log).Scan(from uint64, fn func(Batch) error) error` replays committed batches in order.
-- `(*Log).Segments() []Segment` lists segments with their first and last sequence.
+- `(*Log).Read(seq uint64) ([][]byte, error)` returns one committed batch, located directly through the persistent segment-level index (adopted from `index.idx` or rebuilt from the segment files on open). A sequence whose segment was reclaimed by `DeleteThrough` returns `ErrTruncated`, distinct from `ErrUnknownBatch`.
+- `(*Log).Scan(from uint64, fn func(Batch) error) error` replays committed batches in order. When `from` falls inside a prefix reclaimed by `DeleteThrough`, the replay starts at the first retained batch; with no retained batches it returns without a callback.
+- `(*Log).Segments() []Segment` lists retained segments with their first and last sequence.
+- `(*Log).DeleteThrough(seq uint64) (int, error)` reclaims consumed history with a prefix truncation that deletes whole segment files only and returns the number removed. `seq` must be a committed batch; `0` is a no-op returning `0`. Every complete segment whose highest reservation (last committed batch or last hole marker) is at or below `seq` is removed; batches, groups and segments are never split or rewritten, so `seq` in the middle of a segment deletes one segment fewer. An unknown sequence, a hole, a still-staged batch, or a staged/hole reservation at or below `seq` returns `ErrInvalidRetention` and deletes nothing; a write or sync failure returns `ErrRetentionFailed` and leaves the log readable in either its full old or full new state. The truncation point is journaled atomically in `truncate.idx` before any segment is removed, so a crash is completed on reopen and historical sequences still read as `ErrTruncated` even after `index.idx` is rebuilt. Idempotency keys in removed segments are released and may be reused; keys in retained segments keep their dedup/conflict semantics. Segment numbers are never reused.
 - `type Options struct { SegmentBytes int; Sync bool }`.
-- `log.ErrNotCommitted`, `log.ErrCorruptSegment`, `log.ErrUnknownBatch`, `log.ErrInvalidOptions`, `log.ErrSyncFailed`, `log.ErrInvalidBatchID`, `log.ErrBatchIDConflict` error values.
+- `log.ErrNotCommitted`, `log.ErrCorruptSegment`, `log.ErrUnknownBatch`, `log.ErrInvalidOptions`, `log.ErrSyncFailed`, `log.ErrInvalidBatchID`, `log.ErrBatchIDConflict`, `log.ErrTruncated`, `log.ErrInvalidRetention`, `log.ErrRetentionFailed` error values.
 
 ## Tests
 
@@ -33,4 +34,4 @@ Go 1.22 or newer. Standard library only.
 
 Single writer; concurrent appends are not serialised.
 Records are opaque bytes.
-No compaction and no replication.
+Prefix truncation reclaims whole segment files only; there is no entry-level compaction and no replication.

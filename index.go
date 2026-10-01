@@ -357,7 +357,7 @@ func (l *Log) writeIndexSnapshot(p parsedIndex) error {
 		os.Remove(tmp)
 		return err
 	}
-	if err := f.Sync(); err != nil {
+	if err := syncFile(f); err != nil {
 		f.Close()
 		os.Remove(tmp)
 		return err

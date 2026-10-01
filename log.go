@@ -13,6 +13,13 @@
 // segments, Open rebuilds it from the segment files, so losing the
 // index never loses data — idempotency keys live in the segments, not
 // in the sidecar, and are recovered on every open path.
+//
+// DeleteThrough optionally reclaims consumed history with a prefix
+// truncation that removes whole segment files only. The truncation
+// point is journaled in its own sidecar ("truncate.idx"), separate
+// from the rebuildable index, so historical sequences keep reading as
+// ErrTruncated — never ErrUnknownBatch — across restarts and index
+// rebuilds.
 package log
 
 import (
@@ -57,13 +64,34 @@ var (
 	// used before but the new records differ from the first call's in
 	// length, order or bytes.
 	ErrBatchIDConflict = errors.New("log: batch id conflict")
+	// ErrTruncated is returned by Read and Scan for a sequence whose
+	// segment was reclaimed by a prefix truncation (DeleteThrough). It
+	// is distinct from ErrUnknownBatch: the sequence was once committed,
+	// and that fact survives restarts and index rebuilds.
+	ErrTruncated = errors.New("log: sequence truncated")
+	// ErrInvalidRetention is returned by DeleteThrough when its argument
+	// is not a usable truncation point: a sequence that was never
+	// committed, a hole, a still-staged batch, or a point past which
+	// uncommitted staged or hole-marked reservations would be reclaimed
+	// together with the history. Nothing is deleted when it is returned.
+	ErrInvalidRetention = errors.New("log: invalid retention point")
+	// ErrRetentionFailed is returned by DeleteThrough when persisting
+	// the truncation point or removing the old segment files fails. The
+	// log is left in one of its two consistent states — either the full
+	// old state or the full new state — both of which stay readable; a
+	// later reopen completes or discards the pending truncation.
+	ErrRetentionFailed = errors.New("log: retention failed")
 )
 
 var errClosed = errors.New("log: closed")
 
-// syncFile fsyncs a segment file. It is a variable so tests can
-// simulate sync failures.
+// syncFile fsyncs a file. It is a variable so tests can simulate
+// sync failures.
 var syncFile = func(f *os.File) error { return f.Sync() }
+
+// removeFile deletes a file. It is a variable so tests can simulate
+// segment removal failures during prefix truncation.
+var removeFile = func(name string) error { return os.Remove(name) }
 
 // Options configures a Log opened with Open.
 type Options struct {
@@ -148,9 +176,29 @@ type Log struct {
 	stagedID   map[uint64]string // idempotency key of staged keyed batches
 	ids        map[string]uint64 // key -> seq of staged or committed keyed batch
 	index      map[uint64]entryRef
-	segs       []Segment // segments holding at least one committed batch
+	segs       []segInfo // segment files still on disk, in file order
 	gen        uint64    // publication generation of the last commit
-	closed     bool
+	// through is the persisted prefix-truncation point (DeleteThrough):
+	// every committed sequence <= through used to live in a segment that
+	// has been reclaimed or is pending reclamation. 0 when the log has
+	// never been truncated. Those sequences read as ErrTruncated, never
+	// as ErrUnknownBatch, across reopens and index rebuilds.
+	through uint64
+	closed  bool
+}
+
+// segInfo describes one segment file that still exists on disk. The
+// public Segments view reports only its FirstSeq/LastSeq; the file
+// number and the highest hole marker it carries stay internal. The
+// committed ranges are strictly increasing across the list, but a
+// segment that also holds hole markers may carry holes above LastSeq
+// (e.g. a torn tail), which prefix truncation must not reclaim.
+type segInfo struct {
+	Segment
+	file       int
+	hasCommits bool   // the file holds at least one committed batch
+	maxHole    uint64 // highest reserved sequence in this segment's hole markers
+	hasHoles   bool
 }
 
 // Open opens the log in dir, creating the directory if needed. The
@@ -198,6 +246,30 @@ func Open(dir string, opts Options) (*Log, error) {
 		index:    make(map[uint64]entryRef),
 	}
 
+	// A persisted truncation point makes every segment up to its
+	// segment boundary reclaimable. A crash between persisting the point
+	// and finishing the removal is completed here, before any index is
+	// adopted, so a reopen can only ever see the full old or the full new
+	// state — never half-deleted files.
+	marker, markerOK, err := l.readTruncateMarker()
+	if err != nil {
+		return nil, err
+	}
+	crashCompleted := false
+	if markerOK {
+		var removed int
+		indices, removed, err = l.completeTruncation(indices, marker)
+		if err != nil {
+			return nil, err
+		}
+		l.through = marker.through
+		// A non-zero removal means this reopen is finishing a crash
+		// mid-truncation: the sidecar may still describe the deleted
+		// files. Force the rebuild path so it is rewritten from the
+		// retained segments instead of being adopted and appended to.
+		crashCompleted = removed > 0
+	}
+
 	// Segment sizes are all the segment metadata adoption needs; the
 	// contents are touched only by the cheap CRC pass, never decoded
 	// entry by entry.
@@ -210,8 +282,12 @@ func Open(dir string, opts Options) (*Log, error) {
 		sizes[n] = int(st.Size())
 	}
 
-	snapshot, ok := l.adoptIndex(indices, sizes)
-	if !ok {
+	var snapshot parsedIndex
+	var ok bool
+	if !crashCompleted {
+		snapshot, ok = l.adoptIndex(indices, sizes)
+	}
+	if crashCompleted || !ok {
 		snapshot, err = l.rebuildFromSegments(indices)
 		if err != nil {
 			return nil, err
@@ -227,11 +303,43 @@ func Open(dir string, opts Options) (*Log, error) {
 		if err := l.openCurrent(); err != nil {
 			return nil, err
 		}
+	} else if markerOK {
+		// Every segment has been reclaimed: remember the highest segment
+		// number ever used so the next commit opens segBound+1 instead of
+		// reusing a number the truncation marker still considers gone.
+		l.segIndex = int(marker.segBound)
 	}
 	if err := l.openIndex(); err != nil {
 		return nil, err
 	}
 	return l, nil
+}
+
+// completeTruncation finishes an interrupted DeleteThrough: every
+// segment file whose number is at or before the marker's boundary that
+// is still on disk is removed, and the returned list only contains
+// surviving segments. removed counts files that were actually deleted,
+// letting the caller tell a crash-completing reopen (stale sidecar
+// possible) apart from an ordinary one. A missing file means the crash
+// removal had already reached it; a removal that fails aborts the open,
+// leaving the directory readable but untouched in mixed state for a
+// retry.
+func (l *Log) completeTruncation(indices []int, m truncateMarker) (kept []int, removed int, err error) {
+	kept = make([]int, 0, len(indices))
+	for _, n := range indices {
+		if uint64(n) <= m.segBound {
+			rerr := removeFile(l.segmentPath(n))
+			if rerr != nil && !os.IsNotExist(rerr) {
+				return nil, 0, fmt.Errorf("%w: %v", ErrRetentionFailed, rerr)
+			}
+			if rerr == nil {
+				removed++
+			}
+			continue
+		}
+		kept = append(kept, n)
+	}
+	return kept, removed, nil
 }
 
 // installSnapshot populates the in-memory index, segment listing, staged
@@ -241,6 +349,12 @@ func Open(dir string, opts Options) (*Log, error) {
 // each entry (a single commit or one group) gets one publication
 // generation. A key claimed by two complete entries, or a complete
 // entry whose member framing disagrees with the index, is corruption.
+//
+// Entries at or below the persisted truncation point belong to segment
+// files that are gone (or pending removal): they never reach this view,
+// because Open filters those files out before adoption or rebuild. The
+// truncation point itself still feeds nextSeq so historical sequences
+// stay ErrTruncated rather than being handed out again.
 func (l *Log) installSnapshot(p parsedIndex, indices []int) error {
 	for i := range p.entries {
 		e := &p.entries[i]
@@ -261,8 +375,13 @@ func (l *Log) installSnapshot(p parsedIndex, indices []int) error {
 			}
 		}
 	}
+	if l.through >= l.nextSeq {
+		l.nextSeq = l.through + 1
+	}
 	// Segment listing: one entry per physical segment that holds at
-	// least one committed batch.
+	// least one committed batch. Each entry also tracks the highest hole
+	// marker in its file, which prefix truncation consults so it never
+	// reclaims a segment carrying a live permanent hole.
 	segSeen := make(map[int]int)
 	for i := range p.entries {
 		e := &p.entries[i]
@@ -279,7 +398,8 @@ func (l *Log) installSnapshot(p parsedIndex, indices []int) error {
 			}
 		}
 		if idx, known := segSeen[e.seg]; known {
-			if first < l.segs[idx].FirstSeq {
+			l.segs[idx].hasCommits = true
+			if l.segs[idx].FirstSeq == 0 || first < l.segs[idx].FirstSeq {
 				l.segs[idx].FirstSeq = first
 			}
 			if last > l.segs[idx].LastSeq {
@@ -287,14 +407,47 @@ func (l *Log) installSnapshot(p parsedIndex, indices []int) error {
 			}
 		} else {
 			segSeen[e.seg] = len(l.segs)
-			l.segs = append(l.segs, Segment{FirstSeq: first, LastSeq: last})
+			l.segs = append(l.segs, segInfo{
+				Segment:    Segment{FirstSeq: first, LastSeq: last},
+				file:       e.seg,
+				hasCommits: true,
+			})
 		}
 	}
+	for i := range p.holes {
+		h := &p.holes[i]
+		if idx, known := segSeen[h.seg]; known {
+			for _, seq := range h.seqs {
+				if seq > l.segs[idx].maxHole {
+					l.segs[idx].maxHole = seq
+					l.segs[idx].hasHoles = true
+				}
+			}
+		} else {
+			// A segment carrying only a hole marker and no committed
+			// batch is not part of the public Segments view, but its
+			// reservation must still pin the sequence counter and the
+			// truncation boundary; represent it as a range-less entry.
+			var maxHole uint64
+			for _, seq := range h.seqs {
+				if seq > maxHole {
+					maxHole = seq
+				}
+			}
+			segSeen[h.seg] = len(l.segs)
+			l.segs = append(l.segs, segInfo{file: h.seg, maxHole: maxHole, hasHoles: maxHole > 0})
+		}
+	}
+	// Keep the list ordered by file number even if a hole-only segment
+	// was discovered out of band.
+	sort.SliceStable(l.segs, func(i, j int) bool { return l.segs[i].file < l.segs[j].file })
 	// Holes reserve sequences permanently: they read as staged (never
 	// committed) and are never reused, across any number of reopens.
+	// Holes inside reclaimed segments are gone with their file and are
+	// covered by the truncation point, so they are not staged again.
 	for i := range p.holes {
 		for _, seq := range p.holes[i].seqs {
-			if seq == 0 {
+			if seq == 0 || seq <= l.through {
 				continue
 			}
 			if _, committed := l.index[seq]; !committed {
@@ -833,6 +986,22 @@ func markSeen(members []indexMember, seen map[uint64]bool, seenKey map[string]bo
 // index snapshot. Tampering anywhere but the last segment's tail stays
 // ErrCorruptSegment.
 func (l *Log) rebuildFromSegments(indices []int) (parsedIndex, error) {
+	p, err := l.scanSegments(indices)
+	if err != nil {
+		return parsedIndex{}, err
+	}
+	if err := l.writeIndexSnapshot(p); err != nil {
+		return parsedIndex{}, err
+	}
+	return p, nil
+}
+
+// scanSegments decodes every listed segment into a canonical, sorted
+// parsedIndex, recovering a torn tail of the last listed segment into
+// a durable hole marker exactly like rebuildFromSegments. It never
+// touches the sidecar, so DeleteThrough can rebuild its in-memory view
+// of the retained files and write the snapshot separately.
+func (l *Log) scanSegments(indices []int) (parsedIndex, error) {
 	var p parsedIndex
 	for i, n := range indices {
 		data, err := os.ReadFile(l.segmentPath(n))
@@ -900,9 +1069,6 @@ func (l *Log) rebuildFromSegments(indices []int) (parsedIndex, error) {
 		}
 	}
 	sortIndexSnapshot(&p)
-	if err := l.writeIndexSnapshot(p); err != nil {
-		return parsedIndex{}, err
-	}
 	return p, nil
 }
 
@@ -1175,7 +1341,9 @@ func (l *Log) CommitGroup(batches []Batch) ([]uint64, error) {
 // sequence, located directly through the segment-level index. A staged
 // but uncommitted sequence yields ErrNotCommitted; sequence 0,
 // never-reserved sequences, and sequences beyond the reserved range
-// yield ErrUnknownBatch.
+// yield ErrUnknownBatch. A sequence whose segment was reclaimed by
+// DeleteThrough yields ErrTruncated — it was committed once and stays
+// distinguishable after restarts and index rebuilds.
 //
 // The lock is held only for the index lookup; the segment file is read
 // and the body decoded without it, so a slow read never blocks writers.
@@ -1185,10 +1353,14 @@ func (l *Log) Read(seq uint64) ([][]byte, error) {
 		l.mu.RUnlock()
 		return nil, errClosed
 	}
+	through := l.through
 	ref, ok := l.index[seq]
 	if !ok {
 		_, staged := l.staged[seq]
 		l.mu.RUnlock()
+		if seq > 0 && seq <= through {
+			return nil, ErrTruncated
+		}
 		if staged {
 			return nil, ErrNotCommitted
 		}
@@ -1196,6 +1368,17 @@ func (l *Log) Read(seq uint64) ([][]byte, error) {
 	}
 	l.mu.RUnlock()
 	records, _, err := l.readRef(seq, ref)
+	if err != nil && os.IsNotExist(err) {
+		// A truncation running while this read held an old ref can
+		// remove the file underneath it; re-check under the lock rather
+		// than trusting a stale truncation point.
+		l.mu.RLock()
+		truncated := l.through >= seq
+		l.mu.RUnlock()
+		if truncated {
+			return nil, ErrTruncated
+		}
+	}
 	return records, err
 }
 
@@ -1208,6 +1391,12 @@ func (l *Log) Read(seq uint64) ([][]byte, error) {
 type scanSnapshot struct {
 	gen     uint64
 	highSeq uint64
+	through uint64
+	// firstSeq is the lowest committed sequence still on disk. When a
+	// truncation stops one segment short (a batch or group straddles
+	// the boundary), it can be at or below through; when every segment
+	// has been reclaimed it is 0.
+	firstSeq uint64
 }
 
 // Scan replays committed batches with sequence >= from in increasing
@@ -1215,25 +1404,50 @@ type scanSnapshot struct {
 //
 // The replay is a consistent snapshot: batches committed after the
 // replay starts are invisible to it, and a group commit is seen either
-// whole or not at all. The replay streams batches straight from the
-// segment files one sequence at a time and keeps only the current
-// batch in memory; it never loads the whole replay first. Each
-// sequence lookup takes the lock briefly, while the file read, decode
-// and the fn callback all run outside it, so a long replay never
-// blocks writers.
+// whole or not at all. When from falls inside a prefix reclaimed by
+// DeleteThrough, the replay silently starts at the first retained batch;
+// because truncation removes whole segments and never splits a batch
+// or group, that batch can sit at or below the requested point when a
+// group straddled the boundary and its segment was kept. With no
+// retained batches it returns nil without a callback. The replay
+// streams batches straight from the segment files one sequence at a
+// time and keeps only the current batch in memory; it never loads the
+// whole replay first. Each sequence lookup takes the lock briefly,
+// while the file read, decode and the fn callback all run outside it,
+// so a long replay never blocks writers.
 func (l *Log) Scan(from uint64, fn func(Batch) error) error {
 	l.mu.RLock()
 	if l.closed {
 		l.mu.RUnlock()
 		return errClosed
 	}
-	snap := scanSnapshot{gen: l.gen, highSeq: l.nextSeq - 1}
+	snap := scanSnapshot{gen: l.gen, highSeq: l.nextSeq - 1, through: l.through}
+	for i := range l.segs {
+		if l.segs[i].hasCommits {
+			snap.firstSeq = l.segs[i].FirstSeq
+			break
+		}
+	}
 	l.mu.RUnlock()
 
-	if from > snap.highSeq {
+	// No retained committed batches at all: a from inside the deleted
+	// prefix ends cleanly with no callback.
+	if snap.firstSeq == 0 {
 		return nil
 	}
-	for seq := from; ; {
+	// A from inside the deleted prefix starts no earlier than the first
+	// batch still on disk; deleted batches are skipped, never errors, to
+	// a range scan. A from that names a retained batch (it can sit at or
+	// below through when a group straddled the boundary) is honored
+	// exactly, hence max(from, firstSeq).
+	seq := from
+	if snap.through > 0 && seq < snap.firstSeq {
+		seq = snap.firstSeq
+	}
+	if seq > snap.highSeq {
+		return nil
+	}
+	for {
 		// One brief read-lock per sequence: only the index metadata is
 		// touched while holding it.
 		l.mu.RLock()
@@ -1244,6 +1458,20 @@ func (l *Log) Scan(from uint64, fn func(Batch) error) error {
 		if ok && ref.gen <= snap.gen {
 			records, id, err := l.readRef(seq, ref)
 			if err != nil {
+				if os.IsNotExist(err) {
+					// A concurrent truncation removed this file after the
+					// snapshot was taken; the sequence is now history.
+					l.mu.RLock()
+					truncated := l.through >= seq
+					l.mu.RUnlock()
+					if truncated {
+						if seq == snap.highSeq {
+							break
+						}
+						seq++
+						continue
+					}
+				}
 				return err
 			}
 			if err := fn(Batch{seq: seq, id: id, records: records, owner: l}); err != nil {
@@ -1258,13 +1486,20 @@ func (l *Log) Scan(from uint64, fn func(Batch) error) error {
 	return nil
 }
 
-// Segments lists the segments that hold committed batches, in file
-// order, each with its first and last committed sequence.
+// Segments lists the retained segments that hold committed batches, in
+// file order, each with its first and last committed sequence. Segment
+// files reclaimed by DeleteThrough are not listed; a segment that
+// carries only a hole marker and no committed batch is not listed
+// either.
 func (l *Log) Segments() []Segment {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	out := make([]Segment, len(l.segs))
-	copy(out, l.segs)
+	out := make([]Segment, 0, len(l.segs))
+	for i := range l.segs {
+		if l.segs[i].hasCommits {
+			out = append(out, l.segs[i].Segment)
+		}
+	}
 	return out
 }
 
@@ -1333,8 +1568,31 @@ func (l *Log) readRef(seq uint64, ref entryRef) ([][]byte, string, error) {
 // commitSpan records n newly committed batches covering sequences
 // [first, last] in the segment listing.
 func (l *Log) commitSpan(first, last uint64, n int) {
+	// After a reopen the current segment file may already be listed as a
+	// hole-only segment (a recovered torn tail); the first new commit
+	// upgrades that entry rather than adding a second one for the file.
+	if l.curBatches == 0 && len(l.segs) > 0 && l.segs[len(l.segs)-1].file == l.segIndex {
+		seg := &l.segs[len(l.segs)-1]
+		seg.hasCommits = true
+		if !seg.hasHoles {
+			seg.FirstSeq, seg.LastSeq = first, last
+		} else {
+			if first < seg.FirstSeq || seg.FirstSeq == 0 {
+				seg.FirstSeq = first
+			}
+			if last > seg.LastSeq {
+				seg.LastSeq = last
+			}
+		}
+		l.curBatches += n
+		return
+	}
 	if l.curBatches == 0 {
-		l.segs = append(l.segs, Segment{FirstSeq: first, LastSeq: last})
+		l.segs = append(l.segs, segInfo{
+			Segment:    Segment{FirstSeq: first, LastSeq: last},
+			file:       l.segIndex,
+			hasCommits: true,
+		})
 	} else {
 		seg := &l.segs[len(l.segs)-1]
 		if first < seg.FirstSeq {
@@ -1394,20 +1652,20 @@ func (l *Log) rewriteTail(n, off int, seqs []uint64) error {
 // writeEntry appends one encoded entry to the current segment, rolling
 // to a new segment when the current one is non-empty and would exceed
 // the configured capacity, and returns the offset the entry was
-// written at.
+// written at. A nil l.file also means the previous segment was reclaimed
+// by DeleteThrough: in every case segIndex is the last segment number
+// that has been used (0 before the first write), and the next file is
+// segIndex+1, opened lazily.
 func (l *Log) writeEntry(entry []byte) (int, error) {
 	if l.file != nil && l.fileSize > 0 && l.fileSize+len(entry) > l.opts.SegmentBytes {
 		if err := l.file.Close(); err != nil {
 			return 0, err
 		}
 		l.file = nil
-		l.segIndex++
 		l.curBatches = 0
 	}
 	if l.file == nil {
-		if l.segIndex == 0 {
-			l.segIndex = 1
-		}
+		l.segIndex++
 		if err := l.openCurrent(); err != nil {
 			return 0, err
 		}
