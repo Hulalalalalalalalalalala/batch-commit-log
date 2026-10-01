@@ -53,3 +53,32 @@ func TestStatAfterCommits(t *testing.T) {
 		t.Fatalf("stat = %q, want %q", got, want)
 	}
 }
+
+func TestStatAfterTruncateAll(t *testing.T) {
+	dir := t.TempDir()
+	l, err := log.Open(dir, log.Options{SegmentBytes: 32, Sync: true})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for _, r := range []string{"a", "b", "c"} {
+		b, err := l.Append([][]byte{[]byte(r)})
+		if err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+		if _, err := l.Commit(b); err != nil {
+			t.Fatalf("Commit: %v", err)
+		}
+	}
+	if _, err := l.DeleteThrough(3); err != nil {
+		t.Fatalf("DeleteThrough: %v", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	got := runStat(t, dir)
+	want := "{\"segments\":0,\"firstSeq\":0,\"lastSeq\":0}\n"
+	if got != want {
+		t.Fatalf("stat = %q, want %q", got, want)
+	}
+}
