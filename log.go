@@ -2,13 +2,18 @@
 //
 // A writer stages a batch of opaque records with Append and publishes it
 // atomically with Commit, or publishes several staged batches atomically
-// with CommitGroup. Readers only ever see committed batches, in strictly
-// increasing sequence order starting at 1. Reads locate each batch
-// through a persistent segment-level index in a sidecar file
-// ("index.idx"): Open adopts it incrementally, and when it is missing,
-// truncated, version-mismatched, checksum-bad or contradictory to the
-// segments, Open rebuilds it from the segment files, so losing the
-// index never loses data.
+// with CommitGroup. AppendIdempotent additionally binds a batch to a
+// caller-chosen key: repeating the same key with byte-identical records
+// returns the first batch and its sequence instead of writing again, so
+// network retries and crashes after commit cannot duplicate a batch.
+// Readers only ever see committed batches, in strictly increasing
+// sequence order starting at 1. Reads locate each batch through a
+// persistent segment-level index in a sidecar file ("index.idx"): Open
+// adopts it incrementally, and when it is missing, truncated,
+// version-mismatched, checksum-bad or contradictory to the segments,
+// Open rebuilds it from the segment files, so losing the index never
+// loses data — the idempotency keys live in the segment entries
+// themselves and are recovered by the rebuild as well.
 package log
 
 import (
@@ -23,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 var (
@@ -44,7 +50,34 @@ var (
 	// batches stay staged and keep their reserved sequences; committing
 	// them again retries.
 	ErrSyncFailed = errors.New("log: sync failed")
+	// ErrBatchIDConflict is returned by AppendIdempotent when a key is
+	// already registered for a batch whose records are not byte-for-byte
+	// identical to the request.
+	ErrBatchIDConflict = errors.New("log: batch id conflict")
+	// ErrInvalidBatchID is returned by AppendIdempotent for an empty key,
+	// a key containing NUL, a key that is not valid UTF-8, or a key
+	// longer than 256 bytes.
+	ErrInvalidBatchID = errors.New("log: invalid batch id")
 )
+
+// maxKeyLen is the inclusive upper bound, in bytes, on an idempotency
+// key.
+const maxKeyLen = 256
+
+// validKey reports whether key is a usable idempotency key: non-empty,
+// at most maxKeyLen bytes, valid UTF-8 and free of NUL bytes.
+func validKey(key string) bool {
+	if len(key) == 0 || len(key) > maxKeyLen {
+		return false
+	}
+	if strings.IndexByte(key, 0) >= 0 {
+		return false
+	}
+	if !utf8.ValidString(key) {
+		return false
+	}
+	return true
+}
 
 var errClosed = errors.New("log: closed")
 
@@ -66,15 +99,21 @@ type Options struct {
 
 // Batch is a group of records identified by a single sequence number.
 // A Batch returned by Append is staged; after Commit or CommitGroup it
-// is readable.
+// is readable. A batch created with AppendIdempotent additionally
+// carries a non-empty id; anonymous batches report an empty ID.
 type Batch struct {
 	seq     uint64
+	id      string
 	records [][]byte
 	owner   *Log
 }
 
 // Seq returns the sequence number reserved for the batch.
 func (b Batch) Seq() uint64 { return b.seq }
+
+// ID returns the batch's idempotency key, or an empty string for an
+// anonymous batch staged with Append.
+func (b Batch) ID() string { return b.id }
 
 // Records returns a copy of the batch's records.
 func (b Batch) Records() [][]byte { return copyRecords(b.records) }
@@ -91,12 +130,15 @@ type Segment struct {
 // segments. gen is the publication generation of the commit that
 // published the batch; every member of a group commit shares one gen,
 // which lets a streaming replay snapshot see the whole group or none of
-// it.
+// it. key is non-empty for a batch first staged with AppendIdempotent;
+// keyedBody then says the body uses the BCLK keyed-single layout.
 type entryRef struct {
-	seg    int // segment file number
-	off    int // offset of the batch body within the segment
-	length int // length of the batch body
-	gen    uint64
+	seg       int // segment file number
+	off       int // offset of the batch body within the segment
+	length    int // length of the batch body
+	gen       uint64
+	key       string
+	keyedBody bool
 }
 
 // Log is an append-only batch-commit log stored in a directory of
@@ -123,10 +165,17 @@ type Log struct {
 	curBatches int // committed batches in the current segment
 	nextSeq    uint64
 	staged     map[uint64][][]byte
-	index      map[uint64]entryRef
-	segs       []Segment // segments holding at least one committed batch
-	gen        uint64    // publication generation of the last commit
-	closed     bool
+	// stagedKeyOf maps a staged sequence to its idempotency key; the
+	// empty string means an anonymous batch. stagedKeys is its reverse,
+	// kept only for keyed batches so AppendIdempotent can recognise a
+	// retry of an uncommitted batch.
+	stagedKeyOf   map[uint64]string
+	stagedKeys    map[string]uint64
+	committedKeys map[string]uint64 // key -> seq of a committed batch
+	index         map[uint64]entryRef
+	segs          []Segment // segments holding at least one committed batch
+	gen           uint64    // publication generation of the last commit
+	closed        bool
 }
 
 // Open opens the log in dir, creating the directory if needed. The
@@ -165,11 +214,14 @@ func Open(dir string, opts Options) (*Log, error) {
 	sort.Ints(indices)
 
 	l := &Log{
-		dir:     dir,
-		opts:    opts,
-		nextSeq: 1,
-		staged:  make(map[uint64][][]byte),
-		index:   make(map[uint64]entryRef),
+		dir:           dir,
+		opts:          opts,
+		nextSeq:       1,
+		staged:        make(map[uint64][][]byte),
+		stagedKeyOf:   make(map[uint64]string),
+		stagedKeys:    make(map[string]uint64),
+		committedKeys: make(map[string]uint64),
+		index:         make(map[uint64]entryRef),
 	}
 
 	// Segment sizes are all the segment metadata adoption needs; the
@@ -192,6 +244,9 @@ func Open(dir string, opts Options) (*Log, error) {
 		}
 	}
 	sortIndexSnapshot(&snapshot)
+	if !snapshotKeysUnique(snapshot) {
+		return nil, ErrCorruptSegment
+	}
 	l.installSnapshot(snapshot, indices)
 
 	if len(indices) > 0 {
@@ -216,7 +271,18 @@ func (l *Log) installSnapshot(p parsedIndex, indices []int) {
 		e := &p.entries[i]
 		l.gen++
 		for _, m := range e.members {
-			l.index[m.seq] = entryRef{seg: e.seg, off: m.off, length: m.length, gen: l.gen}
+			l.index[m.seq] = entryRef{
+				seg: e.seg, off: m.off, length: m.length, gen: l.gen,
+				key: m.key, keyedBody: m.keyedBody,
+			}
+			if m.key != "" {
+				// Keys come from complete, checksummed entries only; a
+				// torn keyed batch is a hole and never registers a key,
+				// so a key maps to at most one committed sequence.
+				if _, seen := l.committedKeys[m.key]; !seen {
+					l.committedKeys[m.key] = m.seq
+				}
+			}
 			if m.seq >= l.nextSeq {
 				l.nextSeq = m.seq + 1
 			}
@@ -275,6 +341,25 @@ func (l *Log) installSnapshot(p parsedIndex, indices []int) {
 			}
 		}
 	}
+}
+
+// snapshotKeysUnique reports that no idempotency key is carried by two
+// committed entries. The writer can never produce that, so finding one
+// means the segments were tampered with.
+func snapshotKeysUnique(p parsedIndex) bool {
+	seen := make(map[string]bool)
+	for i := range p.entries {
+		for _, m := range p.entries[i].members {
+			if m.key == "" {
+				continue
+			}
+			if seen[m.key] {
+				return false
+			}
+			seen[m.key] = true
+		}
+	}
+	return true
 }
 
 // sortIndexSnapshot orders a snapshot's records by (segment, offset),
@@ -384,7 +469,8 @@ func (l *Log) adoptIndex(indices []int, sizes map[int]int) (parsedIndex, bool) {
 			}
 			for _, pb := range batches[k:j] {
 				e.members = append(e.members, indexMember{
-					seq: pb.seq, off: pb.off + base, length: pb.length,
+					seq: pb.seq, key: pb.key, keyedBody: pb.keyedSingle,
+					off: pb.off + base, length: pb.length,
 				})
 			}
 			p.entries = append(p.entries, e)
@@ -502,6 +588,7 @@ func (l *Log) verifySidecar(p parsedIndex, indices []int, sizes map[int]int) (co
 	}
 	covered := false
 	seenSeq := make(map[uint64]bool)
+	seenKey := make(map[string]bool)
 	var f *os.File
 	openSeg := -1
 	closeFile := func() {
@@ -557,7 +644,7 @@ func (l *Log) verifySidecar(p parsedIndex, indices []int, sizes map[int]int) (co
 		if openSeg != r.seg || r.off != prevEnd || r.off+r.length > sizes[r.seg] {
 			return 0, 0, false
 		}
-		if !l.verifyDiskRecord(f, r, seenSeq) {
+		if !l.verifyDiskRecord(f, r, seenSeq, seenKey) {
 			return 0, 0, false
 		}
 		prevEnd = r.off + r.length
@@ -583,7 +670,7 @@ func (l *Log) verifySidecar(p parsedIndex, indices []int, sizes map[int]int) (co
 // holding the entry in memory: a small header read, a streaming CRC over
 // a fixed-size scratch buffer, and 8-byte reads of group-member
 // sequences. It never decodes record bodies.
-func (l *Log) verifyDiskRecord(f *os.File, r *sidecarRec, seenSeq map[uint64]bool) bool {
+func (l *Log) verifyDiskRecord(f *os.File, r *sidecarRec, seenSeq map[uint64]bool, seenKey map[string]bool) bool {
 	var hdr [16]byte
 	if _, err := f.ReadAt(hdr[:12], int64(r.off)); err != nil {
 		return false
@@ -620,28 +707,93 @@ func (l *Log) verifyDiskRecord(f *os.File, r *sidecarRec, seenSeq map[uint64]boo
 		e := r.entry
 		switch {
 		case bytes.Equal(hdr[:4], segmentMagic):
+			m := indexMember{}
+			if len(e.members) == 1 {
+				m = e.members[0]
+			}
 			return len(e.members) == 1 &&
-				e.members[0].seq == binary.LittleEndian.Uint64(hdr[4:12]) &&
-				e.members[0].off == r.off+4 &&
-				e.members[0].length == r.length-8 &&
-				markSeen(e.members, seenSeq)
-		case bytes.Equal(hdr[:4], groupMagic):
+				m.key == "" && !m.keyedBody &&
+				m.seq == binary.LittleEndian.Uint64(hdr[4:12]) &&
+				m.off == r.off+4 &&
+				m.length == r.length-8 &&
+				markSeen(e.members, seenSeq) &&
+				markKeysSeen(e.members, seenKey)
+		case bytes.Equal(hdr[:4], keyedMagic):
+			if len(e.members) != 1 {
+				return false
+			}
+			m := e.members[0]
+			if m.key == "" || !m.keyedBody ||
+				m.seq != binary.LittleEndian.Uint64(hdr[4:12]) ||
+				m.off != r.off+4 || m.length != r.length-8 {
+				return false
+			}
+			var kl [4]byte
+			if _, err := f.ReadAt(kl[:], int64(r.off+12)); err != nil {
+				return false
+			}
+			if uint32(len(m.key)) != binary.LittleEndian.Uint32(kl[:]) {
+				return false
+			}
+			kb := make([]byte, len(m.key))
+			if _, err := f.ReadAt(kb, int64(r.off+16)); err != nil {
+				return false
+			}
+			return string(kb) == m.key &&
+				markSeen(e.members, seenSeq) &&
+				markKeysSeen(e.members, seenKey)
+		case bytes.Equal(hdr[:4], groupMagic), bytes.Equal(hdr[:4], mixedMagic):
+			mixed := bytes.Equal(hdr[:4], mixedMagic)
 			if uint32(len(e.members)) != binary.LittleEndian.Uint32(hdr[4:8]) {
 				return false
 			}
-			bodyStart := r.off + 8
+			// Walk the members by the segment's own tiling: each
+			// member prefix starts exactly where the previous body
+			// ended, so the flag byte and key are taken from the
+			// segment rather than the index's claimed offsets.
+			tilePos := r.off + 8
 			for i, m := range e.members {
 				rel := m.off - r.off
 				if m.length <= 0 || rel < 8 || rel+m.length > r.length-4 {
 					return false
 				}
-				if i == 0 {
+				if mixed {
+					var flag [1]byte
+					if _, err := f.ReadAt(flag[:], int64(tilePos)); err != nil {
+						return false
+					}
+					if flag[0]&^memberKeyFlag != 0 {
+						return false
+					}
+					segKeyed := flag[0]&memberKeyFlag != 0
+					if segKeyed != (m.key != "") || m.keyedBody {
+						return false
+					}
+					bodyStart := tilePos + 1
+					if segKeyed {
+						var kl [4]byte
+						if _, err := f.ReadAt(kl[:], int64(tilePos+1)); err != nil {
+							return false
+						}
+						klen := int(binary.LittleEndian.Uint32(kl[:]))
+						if klen != len(m.key) || klen < 1 || klen > maxKeyLen {
+							return false
+						}
+						kb := make([]byte, klen)
+						if _, err := f.ReadAt(kb, int64(tilePos+5)); err != nil {
+							return false
+						}
+						if string(kb) != m.key || !validKey(m.key) {
+							return false
+						}
+						bodyStart = tilePos + 5 + klen
+					}
 					if m.off != bodyStart {
 						return false
 					}
 				} else {
-					prev := e.members[i-1]
-					if m.off != prev.off+prev.length {
+					// An anonymous group: no keys and plain bodies only.
+					if m.key != "" || m.keyedBody || m.off != tilePos {
 						return false
 					}
 				}
@@ -655,8 +807,9 @@ func (l *Log) verifyDiskRecord(f *os.File, r *sidecarRec, seenSeq map[uint64]boo
 				if m.seq != binary.LittleEndian.Uint64(seqBytes[:]) {
 					return false
 				}
+				tilePos = m.off + m.length
 			}
-			return markSeen(e.members, seenSeq)
+			return markSeen(e.members, seenSeq) && markKeysSeen(e.members, seenKey)
 		default:
 			return false
 		}
@@ -698,6 +851,22 @@ func markSeen(members []indexMember, seen map[uint64]bool) bool {
 	return true
 }
 
+// markKeysSeen records every keyed member's key, rejecting duplicates:
+// the writer never produces two complete entries for one key, so a
+// repeated key in the segments is tampering rather than a retry.
+func markKeysSeen(members []indexMember, seen map[string]bool) bool {
+	for _, m := range members {
+		if m.key == "" {
+			continue
+		}
+		if seen[m.key] {
+			return false
+		}
+		seen[m.key] = true
+	}
+	return true
+}
+
 // rebuildFromSegments is the fallback open path: it decodes every
 // segment exactly as a historical open did, recovers a torn tail of the
 // last segment into a durable hole marker, and finally persists a fresh
@@ -735,7 +904,10 @@ func (l *Log) rebuildFromSegments(indices []int) (parsedIndex, error) {
 				members: make([]indexMember, 0, j-k),
 			}
 			for _, pb := range batches[k:j] {
-				e.members = append(e.members, indexMember{seq: pb.seq, off: pb.off, length: pb.length})
+				e.members = append(e.members, indexMember{
+					seq: pb.seq, key: pb.key, keyedBody: pb.keyedSingle,
+					off: pb.off, length: pb.length,
+				})
 			}
 			p.entries = append(p.entries, e)
 			k = j
@@ -791,6 +963,114 @@ func (l *Log) Append(records [][]byte) (Batch, error) {
 	return Batch{seq: seq, records: recs, owner: l}, nil
 }
 
+// AppendIdempotent stages a batch under a caller-chosen idempotency key
+// and reserves the next sequence for it. The key is globally unique
+// within the log directory; records have the same semantics as Append.
+//
+// Retrying the same key is safe after network retries or crashes:
+//
+//   - If the key names a staged, not-yet-committed batch whose records
+//     are byte-for-byte identical (same length, order and bytes),
+//     AppendIdempotent reserves no new sequence and returns that same
+//     staged Batch.
+//   - If the key names a committed batch with identical records, it
+//     likewise returns the first batch: the same Seq and ID, readable
+//     through Read and Scan. Nothing is written and no sequence is
+//     reserved.
+//   - If the key is already in use by a staged or committed batch whose
+//     records differ in any way, the error is ErrBatchIDConflict.
+//
+// An empty key, a key containing a NUL byte, a key that is not valid
+// UTF-8, or a key longer than 256 bytes returns ErrInvalidBatchID.
+func (l *Log) AppendIdempotent(key string, records [][]byte) (Batch, error) {
+	if !validKey(key) {
+		return Batch{}, ErrInvalidBatchID
+	}
+	recs := copyRecords(records)
+
+	// Fast path for a committed key: the segment read happens without
+	// the writer lock, exactly like Read, so a retry that only verifies
+	// existing bytes never blocks concurrent readers.
+	if seq, existing, ok, err := l.lookupCommittedKey(key); err != nil {
+		return Batch{}, err
+	} else if ok {
+		if !recordsEqual(existing, recs) {
+			return Batch{}, ErrBatchIDConflict
+		}
+		return Batch{seq: seq, id: key, records: existing, owner: l}, nil
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return Batch{}, errClosed
+	}
+	// The writer is single by contract, but re-check in case the key was
+	// committed while the lock was free.
+	if seq, ok := l.committedKeys[key]; ok {
+		existing, err := l.readRef(seq, l.index[seq])
+		if err != nil {
+			return Batch{}, err
+		}
+		if !recordsEqual(existing, recs) {
+			return Batch{}, ErrBatchIDConflict
+		}
+		return Batch{seq: seq, id: key, records: existing, owner: l}, nil
+	}
+	// A staged, uncommitted batch for the key.
+	if seq, ok := l.stagedKeys[key]; ok {
+		existing := l.staged[seq]
+		if !recordsEqual(existing, recs) {
+			return Batch{}, ErrBatchIDConflict
+		}
+		return Batch{seq: seq, id: key, records: existing, owner: l}, nil
+	}
+
+	seq := l.nextSeq
+	l.nextSeq++
+	l.staged[seq] = recs
+	l.stagedKeyOf[seq] = key
+	l.stagedKeys[key] = seq
+	return Batch{seq: seq, id: key, records: recs, owner: l}, nil
+}
+
+// lookupCommittedKey returns the records of the committed batch key
+// names, doing the segment read outside the writer lock. ok is false
+// when the key names no committed batch.
+func (l *Log) lookupCommittedKey(key string) (uint64, [][]byte, bool, error) {
+	l.mu.RLock()
+	if l.closed {
+		l.mu.RUnlock()
+		return 0, nil, false, errClosed
+	}
+	seq, ok := l.committedKeys[key]
+	if !ok {
+		l.mu.RUnlock()
+		return 0, nil, false, nil
+	}
+	ref := l.index[seq]
+	l.mu.RUnlock()
+	existing, err := l.readRef(seq, ref)
+	if err != nil {
+		return 0, nil, false, err
+	}
+	return seq, existing, true, nil
+}
+
+// recordsEqual reports whether two record sets agree in length, order
+// and every byte.
+func recordsEqual(a, b [][]byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !bytes.Equal(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
 // Commit makes a staged batch durable and readable, and returns its
 // reserved sequence number. Committing a batch that is not staged —
 // including one already committed — returns ErrUnknownBatch. With
@@ -809,7 +1089,14 @@ func (l *Log) Commit(b Batch) (uint64, error) {
 	if !ok || b.owner != l {
 		return 0, ErrUnknownBatch
 	}
-	entry := encodeBatch(b.seq, recs)
+	key := l.stagedKeyOf[b.seq]
+	keyed := key != ""
+	var entry []byte
+	if keyed {
+		entry = encodeKeyedBatch(b.seq, key, recs)
+	} else {
+		entry = encodeBatch(b.seq, recs)
+	}
 	idxBefore := l.idxSize
 	off, err := l.writeEntry(entry)
 	if err != nil {
@@ -824,15 +1111,24 @@ func (l *Log) Commit(b Batch) (uint64, error) {
 			return 0, fmt.Errorf("%w: %v", ErrSyncFailed, err)
 		}
 	}
+	// The body starts immediately after the 4-byte magic for both the
+	// anonymous and the keyed single layout.
+	bodyOff := off + len(segmentMagic)
+	bodyLen := len(entry) - len(segmentMagic) - 4
+	im := indexMember{seq: b.seq, off: bodyOff, length: bodyLen}
+	ref := entryRef{seg: l.segIndex, off: bodyOff, length: bodyLen}
+	if keyed {
+		im.key = key
+		im.keyedBody = true
+		ref.key = key
+		ref.keyedBody = true
+	}
 	rec := encodeEntryRecord(indexEntry{
 		seg:     l.segIndex,
 		off:     off,
 		length:  len(entry),
 		diskCRC: binary.LittleEndian.Uint32(entry[len(entry)-4:]),
-		members: []indexMember{{
-			seq: b.seq, off: off + len(segmentMagic),
-			length: len(entry) - len(segmentMagic) - 4,
-		}},
+		members: []indexMember{im},
 	})
 	if err := l.appendIndexRecord(rec); err != nil {
 		// Index write/fsync failed: the commit is not published. Roll
@@ -842,8 +1138,14 @@ func (l *Log) Commit(b Batch) (uint64, error) {
 		return 0, err
 	}
 	delete(l.staged, b.seq)
+	delete(l.stagedKeyOf, b.seq)
+	if keyed {
+		delete(l.stagedKeys, key)
+		l.committedKeys[key] = b.seq
+	}
 	l.gen++
-	l.index[b.seq] = entryRef{seg: l.segIndex, off: off + len(segmentMagic), length: len(entry) - len(segmentMagic) - 4, gen: l.gen}
+	ref.gen = l.gen
+	l.index[b.seq] = ref
 	l.commitSpan(b.seq, b.seq, 1)
 	return b.seq, nil
 }
@@ -882,7 +1184,7 @@ func (l *Log) CommitGroup(batches []Batch) ([]uint64, error) {
 			return nil, ErrUnknownBatch
 		}
 		seen[b.seq] = struct{}{}
-		members[i] = groupMember{seq: b.seq, records: recs}
+		members[i] = groupMember{seq: b.seq, key: l.stagedKeyOf[b.seq], records: recs}
 		seqs[i] = b.seq
 	}
 	entry, offs, lens := encodeGroup(members)
@@ -902,7 +1204,7 @@ func (l *Log) CommitGroup(batches []Batch) ([]uint64, error) {
 	}
 	imembers := make([]indexMember, len(members))
 	for i, m := range members {
-		imembers[i] = indexMember{seq: m.seq, off: base + offs[i], length: lens[i]}
+		imembers[i] = indexMember{seq: m.seq, key: m.key, off: base + offs[i], length: lens[i]}
 	}
 	rec := encodeEntryRecord(indexEntry{
 		seg:     l.segIndex,
@@ -921,7 +1223,14 @@ func (l *Log) CommitGroup(batches []Batch) ([]uint64, error) {
 	l.gen++
 	for i, m := range members {
 		delete(l.staged, m.seq)
-		l.index[m.seq] = entryRef{seg: l.segIndex, off: base + offs[i], length: lens[i], gen: l.gen}
+		delete(l.stagedKeyOf, m.seq)
+		if m.key != "" {
+			delete(l.stagedKeys, m.key)
+			l.committedKeys[m.key] = m.seq
+		}
+		l.index[m.seq] = entryRef{
+			seg: l.segIndex, off: base + offs[i], length: lens[i], gen: l.gen, key: m.key,
+		}
 		if m.seq < first {
 			first = m.seq
 		}
@@ -1007,7 +1316,7 @@ func (l *Log) Scan(from uint64, fn func(Batch) error) error {
 			if err != nil {
 				return err
 			}
-			if err := fn(Batch{seq: seq, records: records, owner: l}); err != nil {
+			if err := fn(Batch{seq: seq, id: ref.key, records: records, owner: l}); err != nil {
 				return err
 			}
 		}
@@ -1051,14 +1360,15 @@ func (l *Log) Close() error {
 }
 
 // readRef loads the records of a committed batch straight from its
-// segment file. It performs no locking and must be called without l.mu
-// held: the segment read and body decode happen entirely on the read
-// path, outside the writer lock. The on-disk bytes are immutable once
-// committed (only the torn tail of the very last segment is ever
-// rewritten, and that tail never has an index entry), so a ref captured
-// under the read lock stays valid afterwards. The returned records are
-// freshly decoded, so callers can mutate them without affecting the
-// log or later reads.
+// segment file. It performs no locking itself. On the read path it must
+// be called without l.mu held, so the segment read and body decode never
+// block a committing writer; the write path also calls it for
+// AppendIdempotent dedup, where holding the writer lock is harmless
+// (single writer). The on-disk bytes are immutable once committed (only
+// the torn tail of the very last segment is ever rewritten, and that
+// tail never has an index entry), so a ref captured under the read lock
+// stays valid afterwards. The returned records are freshly decoded, so
+// callers can mutate them without affecting the log or later reads.
 func (l *Log) readRef(seq uint64, ref entryRef) ([][]byte, error) {
 	f, err := os.Open(l.segmentPath(ref.seg))
 	if err != nil {
@@ -1069,7 +1379,13 @@ func (l *Log) readRef(seq uint64, ref entryRef) ([][]byte, error) {
 	if _, err := f.ReadAt(body, int64(ref.off)); err != nil {
 		return nil, err
 	}
-	got, records, err := decodeBody(body)
+	var got uint64
+	var records [][]byte
+	if ref.keyedBody {
+		got, records, err = decodeKeyedBody(body, ref.key)
+	} else {
+		got, records, err = decodeBody(body)
+	}
 	if err != nil {
 		return nil, err
 	}
