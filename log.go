@@ -2,7 +2,10 @@
 //
 // A writer stages a batch of opaque records with Append and publishes it
 // atomically with Commit, or publishes several staged batches atomically
-// with CommitGroup. AppendIdempotent stages a batch under a caller key:
+// with CommitGroup. A staged batch can instead be abandoned with Abort,
+// which turns its reserved sequence into a permanent hole — durable
+// across restarts and index rebuilds — and releases its idempotency key.
+// AppendIdempotent stages a batch under a caller key:
 // repeating a key with byte-identical records returns the first batch
 // and its sequence across retries and restarts, while different records
 // conflict. Readers only ever see committed batches, in strictly
@@ -123,6 +126,11 @@ var (
 	// sequence. Nothing is deleted — no segment, index or idempotency key
 	// changes — until every consumer has confirmed the prefix.
 	ErrRetentionBlocked = errors.New("log: retention blocked by consumer")
+	// ErrAbortFailed is returned by Abort when writing, closing or syncing
+	// the hole marker or its index sidecar record fails. The batch stays
+	// staged with its reserved sequence and idempotency key; retrying the
+	// abort or committing instead cannot produce a duplicate record.
+	ErrAbortFailed = errors.New("log: abort failed")
 )
 
 var errClosed = errors.New("log: closed")
@@ -1276,7 +1284,8 @@ func recordsEqual(a, b [][]byte) bool {
 
 // Commit makes a staged batch durable and readable, and returns its
 // reserved sequence number. Committing a batch that is not staged —
-// including one already committed — returns ErrUnknownBatch. With
+// including one already committed or already aborted — returns
+// ErrUnknownBatch. With
 // Options.Sync a returned commit is durable: the segment entry and the
 // index sidecar record are both synced, one fsync each. If either
 // fsync fails Commit returns ErrSyncFailed, rolls both files back and
@@ -1289,7 +1298,10 @@ func (l *Log) Commit(b Batch) (uint64, error) {
 		return 0, errClosed
 	}
 	recs, ok := l.staged[b.seq]
-	if !ok || b.owner != l {
+	if !ok || recs == nil || b.owner != l {
+		// Not staged here: never staged, a foreign or zero batch, already
+		// committed, or aborted (an aborted sequence is a permanent hole,
+		// staged only as a nil-records marker).
 		return 0, ErrUnknownBatch
 	}
 	id := l.stagedID[b.seq]
@@ -1356,7 +1368,9 @@ func (l *Log) Commit(b Batch) (uint64, error) {
 // synced once. Each batch keeps the sequence it reserved at Append, and
 // the batches become visible in that reserved order — the merge never
 // reorders them. If any batch is not staged — including one already
-// committed — nothing is written and the error is ErrUnknownBatch. If
+// committed or already aborted — nothing is written, every genuinely
+// staged batch in the group stays staged, and the error is
+// ErrUnknownBatch. If
 // either fsync fails, the segment entry and the index record are rolled
 // back and every batch stays staged with its reserved sequence; the
 // error is ErrSyncFailed and retrying the group commits it without
@@ -1378,7 +1392,10 @@ func (l *Log) CommitGroup(batches []Batch) ([]uint64, error) {
 	keyed := false
 	for i, b := range batches {
 		recs, ok := l.staged[b.seq]
-		if !ok || b.owner != l {
+		if !ok || recs == nil || b.owner != l {
+			// Includes an aborted batch: its sequence is a permanent
+			// hole. Nothing is written and every genuinely staged
+			// batch in the group stays staged.
 			return nil, ErrUnknownBatch
 		}
 		if _, dup := seen[b.seq]; dup {

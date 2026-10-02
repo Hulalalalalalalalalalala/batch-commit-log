@@ -103,3 +103,34 @@ func TestStatAfterPrefixTruncation(t *testing.T) {
 		t.Fatalf("partial stat = %q, want %q", got, want)
 	}
 }
+
+func TestStatWithAbortedBatch(t *testing.T) {
+	dir := t.TempDir()
+	l, err := log.Open(dir, log.Options{SegmentBytes: 32, Sync: true})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	b, err := l.Append([][]byte{[]byte("a")})
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if _, err := l.Commit(b); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	// An aborted batch is a permanent hole: invisible to stat, and its
+	// hole-only segment is not counted.
+	ab, err := l.Append([][]byte{[]byte("dropped")})
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := l.Abort(ab); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+	l.Close()
+
+	got := runStat(t, dir)
+	want := "{\"segments\":1,\"firstSeq\":1,\"lastSeq\":1}\n"
+	if got != want {
+		t.Fatalf("stat = %q, want %q", got, want)
+	}
+}
