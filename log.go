@@ -23,11 +23,12 @@
 //
 // Named consumers persist their replay checkpoints in a third sidecar
 // ("consumers.idx"): AckConsumer confirms a processed prefix,
-// ConsumerSeq reports it and DropConsumer retires the registration.
-// Unlike index.idx the checkpoint file is authoritative — a damaged or
-// unsupported image makes Open return ErrCorruptCheckpoint — and a
-// registered consumer keeps prefix history from being reclaimed until
-// it has confirmed it.
+// AckConsumerState confirms it together with an opaque replay context,
+// ConsumerSeq and ConsumerCheckpoint report them and DropConsumer
+// retires the registration and its context. Unlike index.idx the
+// checkpoint file is authoritative — a damaged or unsupported image
+// makes Open return ErrCorruptCheckpoint — and a registered consumer
+// keeps prefix history from being reclaimed until it has confirmed it.
 //
 // Abort abandons a staged batch without committing it: the reserved
 // sequence becomes a permanent hole (durable across restarts and index
@@ -104,14 +105,24 @@ var (
 	// DropConsumer for a syntactically legal name that was never
 	// registered. Registration happens only through AckConsumer(name, 0).
 	ErrUnknownConsumer = errors.New("log: unknown consumer")
-	// ErrInvalidAck is returned by AckConsumer when seq cannot confirm a
-	// prefix: it moves a registered consumer backwards, names a batch
-	// that is not committed (unknown, a permanent hole or still staged),
-	// names history already reclaimed by DeleteThrough, or a still-staged
-	// batch with a smaller sequence would be reclaimed together with the
-	// confirmed prefix. Permanent holes above the confirmed prefix may be
-	// skipped, and a group may be confirmed as a unit.
+	// ErrInvalidAck is returned by AckConsumer and AckConsumerState when
+	// seq cannot confirm a prefix: it moves a registered consumer
+	// backwards, names a batch that is not committed (unknown, a
+	// permanent hole or still staged), names history already reclaimed by
+	// DeleteThrough, or a still-staged batch with a smaller sequence
+	// would be reclaimed together with the confirmed prefix. Permanent
+	// holes above the confirmed prefix may be skipped, and a group may be
+	// confirmed as a unit.
 	ErrInvalidAck = errors.New("log: invalid ack")
+	// ErrInvalidCheckpointState is returned by AckConsumerState when the
+	// opaque replay context exceeds MaxCheckpointState (1 MiB). Nothing is
+	// written when it is returned.
+	ErrInvalidCheckpointState = errors.New("log: invalid checkpoint state")
+	// ErrCheckpointConflict is returned by AckConsumerState when a call
+	// names the already-confirmed sequence but carries a different replay
+	// context than the one stored. The saved seq and context win; the
+	// call writes nothing. Same-seq calls must repeat the same context.
+	ErrCheckpointConflict = errors.New("log: checkpoint conflict")
 	// ErrCheckpointFailed is returned when a checkpoint change cannot be
 	// made durable: forcing the committed data to disk, writing or
 	// syncing consumers.idx fails. No consumer state changes and the call
@@ -240,9 +251,10 @@ type Log struct {
 	// as ErrUnknownBatch, across reopens and index rebuilds.
 	through uint64
 	// consumers maps every registered consumer name to its confirmed
-	// prefix sequence (0 for a name just registered). Persisted in
-	// consumers.idx, which is authoritative state unlike index.idx.
-	consumers map[string]uint64
+	// prefix sequence (0 for a name just registered) and the opaque
+	// replay context published with it. Persisted in consumers.idx,
+	// which is authoritative state unlike index.idx.
+	consumers map[string]consumerStateRec
 	// segDirty records segment files carrying committed bytes that no
 	// successful fsync has covered yet (Options.Sync == false commits). A
 	// checkpoint confirmation must barrier-sync exactly these files
@@ -310,7 +322,7 @@ func Open(dir string, opts Options) (*Log, error) {
 		stagedID:  make(map[uint64]string),
 		ids:       make(map[string]uint64),
 		index:     make(map[uint64]entryRef),
-		consumers: make(map[string]uint64),
+		consumers: make(map[string]consumerStateRec),
 		segDirty:  make(map[int]bool),
 	}
 
@@ -425,7 +437,7 @@ func Open(dir string, opts Options) (*Log, error) {
 					}
 				}
 			}
-			l.consumers[e.name] = e.seq
+			l.consumers[e.name] = consumerStateRec{seq: e.seq, state: cloneState(e.state)}
 		}
 	}
 	return l, nil
