@@ -225,7 +225,7 @@ func (l *Log) DeleteThrough(seq uint64) (int, error) {
 	}
 	if highestCommitted > 0 {
 		for _, confirmed := range l.consumers {
-			if highestCommitted > confirmed {
+			if highestCommitted > confirmed.seq {
 				return 0, ErrRetentionBlocked
 			}
 		}

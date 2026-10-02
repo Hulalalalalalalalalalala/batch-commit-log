@@ -100,18 +100,30 @@ var (
 	// longer than 256 bytes). Consumer names and idempotency keys are
 	// separate namespaces, but they share the rule.
 	ErrInvalidConsumer = errors.New("log: invalid consumer name")
-	// ErrUnknownConsumer is returned by AckConsumer, ConsumerSeq and
-	// DropConsumer for a syntactically legal name that was never
-	// registered. Registration happens only through AckConsumer(name, 0).
+	// ErrUnknownConsumer is returned by AckConsumer, AckConsumerState,
+	// ConsumerSeq, ConsumerCheckpoint and DropConsumer for a syntactically
+	// legal name that was never registered. Registration happens only
+	// through AckConsumer(name, 0) or AckConsumerState(name, 0, state).
 	ErrUnknownConsumer = errors.New("log: unknown consumer")
-	// ErrInvalidAck is returned by AckConsumer when seq cannot confirm a
-	// prefix: it moves a registered consumer backwards, names a batch
-	// that is not committed (unknown, a permanent hole or still staged),
-	// names history already reclaimed by DeleteThrough, or a still-staged
-	// batch with a smaller sequence would be reclaimed together with the
-	// confirmed prefix. Permanent holes above the confirmed prefix may be
-	// skipped, and a group may be confirmed as a unit.
+	// ErrInvalidAck is returned by AckConsumer and AckConsumerState when
+	// seq cannot confirm a prefix: it moves a registered consumer
+	// backwards, names a batch that is not committed (unknown, a
+	// permanent hole or still staged), names history already reclaimed by
+	// DeleteThrough, or a still-staged batch with a smaller sequence
+	// would be reclaimed together with the confirmed prefix. Permanent
+	// holes above the confirmed prefix may be skipped, and a group may be
+	// confirmed as a unit.
 	ErrInvalidAck = errors.New("log: invalid ack")
+	// ErrInvalidCheckpointState is returned by AckConsumerState when the
+	// opaque state blob exceeds 1048576 bytes. Nothing is written and the
+	// checkpoint does not change.
+	ErrInvalidCheckpointState = errors.New("log: invalid checkpoint state")
+	// ErrCheckpointConflict is returned by AckConsumerState when the
+	// stored sequence is repeated with a different state blob. Sequence
+	// and state are published together, so reconfirming a sequence may
+	// only repeat the exact state; changing the state requires progress.
+	// Nothing is written.
+	ErrCheckpointConflict = errors.New("log: checkpoint conflict")
 	// ErrCheckpointFailed is returned when a checkpoint change cannot be
 	// made durable: forcing the committed data to disk, writing or
 	// syncing consumers.idx fails. No consumer state changes and the call
@@ -119,9 +131,10 @@ var (
 	ErrCheckpointFailed = errors.New("log: checkpoint failed")
 	// ErrCorruptCheckpoint is returned by Open when consumers.idx is
 	// present but cannot be trusted: truncated, checksum-bad, framed
-	// wrongly, from an unsupported version or semantically impossible
-	// (a confirmed sequence that is not committed, already reclaimed,
-	// ahead of a staged batch, or duplicated). Progress is never reset
+	// wrongly, from an unsupported version, structurally invalid
+	// (including an oversized state blob) or semantically impossible (a
+	// confirmed sequence that is not committed, already reclaimed, ahead
+	// of a staged batch, or duplicated). Progress is never reset
 	// silently; the caller must intervene.
 	ErrCorruptCheckpoint = errors.New("log: corrupt checkpoint")
 	// ErrRetentionBlocked is returned by DeleteThrough when the reclaimable
@@ -240,9 +253,10 @@ type Log struct {
 	// as ErrUnknownBatch, across reopens and index rebuilds.
 	through uint64
 	// consumers maps every registered consumer name to its confirmed
-	// prefix sequence (0 for a name just registered). Persisted in
-	// consumers.idx, which is authoritative state unlike index.idx.
-	consumers map[string]uint64
+	// prefix sequence (0 for a name just registered) and the opaque
+	// replay state published together with it. Persisted in consumers.idx,
+	// which is authoritative state unlike index.idx.
+	consumers map[string]consumerState
 	// segDirty records segment files carrying committed bytes that no
 	// successful fsync has covered yet (Options.Sync == false commits). A
 	// checkpoint confirmation must barrier-sync exactly these files
@@ -310,7 +324,7 @@ func Open(dir string, opts Options) (*Log, error) {
 		stagedID:  make(map[uint64]string),
 		ids:       make(map[string]uint64),
 		index:     make(map[uint64]entryRef),
-		consumers: make(map[string]uint64),
+		consumers: make(map[string]consumerState),
 		segDirty:  make(map[int]bool),
 	}
 
@@ -425,7 +439,7 @@ func Open(dir string, opts Options) (*Log, error) {
 					}
 				}
 			}
-			l.consumers[e.name] = e.seq
+			l.consumers[e.name] = consumerState{seq: e.seq, state: e.state}
 		}
 	}
 	return l, nil
