@@ -20,6 +20,15 @@
 // from the rebuildable index, so historical sequences keep reading as
 // ErrTruncated — never ErrUnknownBatch — across restarts and index
 // rebuilds.
+//
+// Named consumers persist their own replay positions in a third
+// sidecar ("consumers.idx") with AckConsumer, ConsumerSeq and
+// DropConsumer. That file is authoritative and never rebuilt: a
+// damaged or unsupported checkpoint makes Open fail with
+// ErrCorruptCheckpoint rather than resetting progress. Each
+// acknowledgement also protects the unacknowledged prefix from
+// DeleteThrough, which returns ErrRetentionBlocked while any batch
+// slated for removal sits above a registered consumer's point.
 package log
 
 import (
@@ -184,7 +193,16 @@ type Log struct {
 	// never been truncated. Those sequences read as ErrTruncated, never
 	// as ErrUnknownBatch, across reopens and index rebuilds.
 	through uint64
-	closed  bool
+	// consumers maps every registered consumer name to its acknowledged
+	// sequence (the processed-by-sequence prefix). It mirrors
+	// consumers.idx, which unlike index.idx is authoritative and never
+	// rebuilt or reset. ackSyncedSeg is the highest segment file number
+	// whose committed bytes have been fsynced on behalf of an
+	// acknowledgement, so Sync:false logs still hand back durable acks
+	// without re-syncing sealed files.
+	consumers    map[string]uint64
+	ackSyncedSeg uint64
+	closed       bool
 }
 
 // segInfo describes one segment file that still exists on disk. The
@@ -237,13 +255,14 @@ func Open(dir string, opts Options) (*Log, error) {
 	sort.Ints(indices)
 
 	l := &Log{
-		dir:      dir,
-		opts:     opts,
-		nextSeq:  1,
-		staged:   make(map[uint64][][]byte),
-		stagedID: make(map[uint64]string),
-		ids:      make(map[string]uint64),
-		index:    make(map[uint64]entryRef),
+		dir:       dir,
+		opts:      opts,
+		nextSeq:   1,
+		staged:    make(map[uint64][][]byte),
+		stagedID:  make(map[uint64]string),
+		ids:       make(map[string]uint64),
+		index:     make(map[uint64]entryRef),
+		consumers: make(map[string]uint64),
 	}
 
 	// A persisted truncation point makes every segment up to its
@@ -310,6 +329,13 @@ func Open(dir string, opts Options) (*Log, error) {
 		l.segIndex = int(marker.segBound)
 	}
 	if err := l.openIndex(); err != nil {
+		return nil, err
+	}
+	// Consumer checkpoints are authoritative metadata, unlike the
+	// rebuildable sidecar above: a present-but-damaged file fails the
+	// open rather than resetting anyone's replay progress. A missing
+	// file is the historical "no consumers" case.
+	if err := l.loadConsumers(); err != nil {
 		return nil, err
 	}
 	return l, nil

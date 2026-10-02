@@ -153,6 +153,15 @@ func (l *Log) writeTruncateMarker(m truncateMarker) error {
 // scratch. Idempotency keys that lived in deleted segments are
 // released and may be reused; keys in retained segments keep their
 // same-key dedup and different-key ErrBatchIDConflict.
+//
+// Registered consumers protect the prefix they have not replayed: if
+// any committed batch in the otherwise-deletable prefix is above any
+// consumer's acknowledged point, DeleteThrough returns
+// ErrRetentionBlocked before the marker is written, so files, the
+// index and idempotency keys all stay put. Once every consumer has
+// acknowledged the prefix (or has been dropped), reclamation proceeds
+// exactly as above; with no consumers registered the behavior is
+// unchanged.
 func (l *Log) DeleteThrough(seq uint64) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -208,6 +217,30 @@ func (l *Log) DeleteThrough(seq uint64) (int, error) {
 	}
 	segBound := deleted[len(deleted)-1]
 	retained := physical[len(deleted):]
+
+	// Registered consumers pin the history they have not acknowledged
+	// yet. When the reclaimable prefix carries any committed batch above
+	// the slowest consumer's point, the whole call is refused before
+	// anything (marker, files, index or idempotency keys) changes. Hole
+	// markers do not count: only committed batches do, and the segments'
+	// LastSeq is exactly the highest committed sequence of each file.
+	if len(l.consumers) > 0 {
+		var blocked uint64
+		for i := range l.segs {
+			s := &l.segs[i]
+			if s.file > segBound {
+				break
+			}
+			if s.hasCommits && s.LastSeq > blocked {
+				blocked = s.LastSeq
+			}
+		}
+		for _, ack := range l.consumers {
+			if blocked > ack {
+				return 0, ErrRetentionBlocked
+			}
+		}
+	}
 
 	// 1) Durably commit the truncation point before removing anything.
 	// A failure here leaves the full old state byte-for-byte.
