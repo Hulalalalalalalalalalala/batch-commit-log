@@ -20,6 +20,14 @@
 // from the rebuildable index, so historical sequences keep reading as
 // ErrTruncated — never ErrUnknownBatch — across restarts and index
 // rebuilds.
+//
+// Named consumers persist their replay checkpoints in a third sidecar
+// ("consumers.idx"): AckConsumer confirms a processed prefix,
+// ConsumerSeq reports it and DropConsumer retires the registration.
+// Unlike index.idx the checkpoint file is authoritative — a damaged or
+// unsupported image makes Open return ErrCorruptCheckpoint — and a
+// registered consumer keeps prefix history from being reclaimed until
+// it has confirmed it.
 package log
 
 import (
@@ -81,6 +89,40 @@ var (
 	// old state or the full new state — both of which stay readable; a
 	// later reopen completes or discards the pending truncation.
 	ErrRetentionFailed = errors.New("log: retention failed")
+	// ErrInvalidConsumer is returned for a consumer name that fails the
+	// idempotency-key naming rule (empty, NUL byte, invalid UTF-8 or
+	// longer than 256 bytes). Consumer names and idempotency keys are
+	// separate namespaces, but they share the rule.
+	ErrInvalidConsumer = errors.New("log: invalid consumer name")
+	// ErrUnknownConsumer is returned by AckConsumer, ConsumerSeq and
+	// DropConsumer for a syntactically legal name that was never
+	// registered. Registration happens only through AckConsumer(name, 0).
+	ErrUnknownConsumer = errors.New("log: unknown consumer")
+	// ErrInvalidAck is returned by AckConsumer when seq cannot confirm a
+	// prefix: it moves a registered consumer backwards, names a batch
+	// that is not committed (unknown, a permanent hole or still staged),
+	// names history already reclaimed by DeleteThrough, or a still-staged
+	// batch with a smaller sequence would be reclaimed together with the
+	// confirmed prefix. Permanent holes above the confirmed prefix may be
+	// skipped, and a group may be confirmed as a unit.
+	ErrInvalidAck = errors.New("log: invalid ack")
+	// ErrCheckpointFailed is returned when a checkpoint change cannot be
+	// made durable: forcing the committed data to disk, writing or
+	// syncing consumers.idx fails. No consumer state changes and the call
+	// can be retried.
+	ErrCheckpointFailed = errors.New("log: checkpoint failed")
+	// ErrCorruptCheckpoint is returned by Open when consumers.idx is
+	// present but cannot be trusted: truncated, checksum-bad, framed
+	// wrongly, from an unsupported version or semantically impossible
+	// (a confirmed sequence that is not committed, already reclaimed,
+	// ahead of a staged batch, or duplicated). Progress is never reset
+	// silently; the caller must intervene.
+	ErrCorruptCheckpoint = errors.New("log: corrupt checkpoint")
+	// ErrRetentionBlocked is returned by DeleteThrough when the reclaimable
+	// prefix contains a batch above at least one consumer's confirmed
+	// sequence. Nothing is deleted — no segment, index or idempotency key
+	// changes — until every consumer has confirmed the prefix.
+	ErrRetentionBlocked = errors.New("log: retention blocked by consumer")
 )
 
 var errClosed = errors.New("log: closed")
@@ -184,7 +226,18 @@ type Log struct {
 	// never been truncated. Those sequences read as ErrTruncated, never
 	// as ErrUnknownBatch, across reopens and index rebuilds.
 	through uint64
-	closed  bool
+	// consumers maps every registered consumer name to its confirmed
+	// prefix sequence (0 for a name just registered). Persisted in
+	// consumers.idx, which is authoritative state unlike index.idx.
+	consumers map[string]uint64
+	// segDirty records segment files carrying committed bytes that no
+	// successful fsync has covered yet (Options.Sync == false commits). A
+	// checkpoint confirmation must barrier-sync exactly these files
+	// before it becomes durable, even when Sync is false. Rolling to a
+	// new segment does not clear the old file's bit: its bytes stay
+	// un-durable until a sync or a truncation that removes it.
+	segDirty map[int]bool
+	closed   bool
 }
 
 // segInfo describes one segment file that still exists on disk. The
@@ -237,13 +290,15 @@ func Open(dir string, opts Options) (*Log, error) {
 	sort.Ints(indices)
 
 	l := &Log{
-		dir:      dir,
-		opts:     opts,
-		nextSeq:  1,
-		staged:   make(map[uint64][][]byte),
-		stagedID: make(map[uint64]string),
-		ids:      make(map[string]uint64),
-		index:    make(map[uint64]entryRef),
+		dir:       dir,
+		opts:      opts,
+		nextSeq:   1,
+		staged:    make(map[uint64][][]byte),
+		stagedID:  make(map[uint64]string),
+		ids:       make(map[string]uint64),
+		index:     make(map[uint64]entryRef),
+		consumers: make(map[string]uint64),
+		segDirty:  make(map[int]bool),
 	}
 
 	// A persisted truncation point makes every segment up to its
@@ -297,6 +352,16 @@ func Open(dir string, opts Options) (*Log, error) {
 	if err := l.installSnapshot(snapshot, indices); err != nil {
 		return nil, err
 	}
+	// A previous process may have run with Options.Sync false and left
+	// committed bytes in the page cache. The first checkpoint must
+	// barrier them too, so assume every retained segment needs a sync
+	// until one actually happens; an already-durable file merely costs a
+	// redundant fsync.
+	for i := range l.segs {
+		if l.segs[i].hasCommits {
+			l.segDirty[l.segs[i].file] = true
+		}
+	}
 
 	if len(indices) > 0 {
 		l.segIndex = indices[len(indices)-1]
@@ -311,6 +376,44 @@ func Open(dir string, opts Options) (*Log, error) {
 	}
 	if err := l.openIndex(); err != nil {
 		return nil, err
+	}
+	// Consumer checkpoints are authoritative metadata loaded last, once
+	// the committed set, holes and truncation point are final. A
+	// checkpoint that disagrees with that state (recycled, uncommitted or
+	// unknown target, or a staged batch before it) is fatal corruption —
+	// progress is never silently reset.
+	centries, cOK, cerr := l.readConsumers()
+	if cerr != nil {
+		return nil, cerr
+	}
+	if cOK {
+		for _, e := range centries {
+			if !validConsumerName(e.name) {
+				return nil, ErrCorruptCheckpoint
+			}
+			if _, dup := l.consumers[e.name]; dup {
+				return nil, ErrCorruptCheckpoint
+			}
+			if e.seq > 0 && e.seq > l.through {
+				// Above the truncation point the checkpoint must name a
+				// batch that is committed now, with no staged batch below
+				// it. A value at or below through is ordinary
+				// post-truncation state: the consumer confirmed a prefix
+				// DeleteThrough was allowed to reclaim (its checkpoint
+				// can sit below the anchor when the anchor lives in a
+				// retained segment), and the bytes are gone, so there is
+				// nothing stronger to re-verify.
+				if _, committed := l.index[e.seq]; !committed {
+					return nil, ErrCorruptCheckpoint
+				}
+				for s, recs := range l.staged {
+					if recs != nil && s < e.seq {
+						return nil, ErrCorruptCheckpoint
+					}
+				}
+			}
+			l.consumers[e.name] = e.seq
+		}
 	}
 	return l, nil
 }
@@ -1239,6 +1342,11 @@ func (l *Log) Commit(b Batch) (uint64, error) {
 		gen: l.gen, id: id, keyed: id != "",
 	}
 	l.commitSpan(b.seq, b.seq, 1)
+	if l.opts.Sync {
+		delete(l.segDirty, l.segIndex)
+	} else {
+		l.segDirty[l.segIndex] = true
+	}
 	return b.seq, nil
 }
 
@@ -1334,6 +1442,11 @@ func (l *Log) CommitGroup(batches []Batch) ([]uint64, error) {
 		}
 	}
 	l.commitSpan(first, last, len(members))
+	if l.opts.Sync {
+		delete(l.segDirty, l.segIndex)
+	} else {
+		l.segDirty[l.segIndex] = true
+	}
 	return seqs, nil
 }
 
@@ -1691,6 +1804,51 @@ func (l *Log) openCurrent() error {
 	}
 	l.file = f
 	l.fileSize = int(st.Size())
+	return nil
+}
+
+// syncDirtySegments forces every segment with committed bytes not yet
+// known durable to disk before a checkpoint claims those bytes. The
+// current segment is synced through its live append handle; segments
+// rolled past are closed and reopened read-only just for the fsync. A
+// Sync:false commit may also have created the segment file without the
+// directory entry ever being flushed, so the directory is synced too
+// (best effort, as everywhere else). Synced files drop out of
+// segDirty, so a failed call followed by a retry never duplicates
+// meaningful work. A segment that a concurrent DeleteThrough removed is
+// simply forgotten — its data is gone by design and needs no sync.
+func (l *Log) syncDirtySegments() error {
+	if l.file != nil && l.segDirty[l.segIndex] {
+		if err := syncFile(l.file); err != nil {
+			return fmt.Errorf("%w: %v", ErrCheckpointFailed, err)
+		}
+		delete(l.segDirty, l.segIndex)
+	}
+	dirty := make([]int, 0, len(l.segDirty))
+	for n := range l.segDirty {
+		dirty = append(dirty, n)
+	}
+	sort.Ints(dirty)
+	for _, n := range dirty {
+		f, err := os.Open(l.segmentPath(n))
+		if err != nil {
+			if os.IsNotExist(err) {
+				delete(l.segDirty, n)
+				continue
+			}
+			return fmt.Errorf("%w: %v", ErrCheckpointFailed, err)
+		}
+		serr := syncFile(f)
+		cerr := f.Close()
+		if serr != nil {
+			return fmt.Errorf("%w: %v", ErrCheckpointFailed, serr)
+		}
+		if cerr != nil {
+			return fmt.Errorf("%w: %v", ErrCheckpointFailed, cerr)
+		}
+		delete(l.segDirty, n)
+	}
+	_ = syncDir(l.dir)
 	return nil
 }
 

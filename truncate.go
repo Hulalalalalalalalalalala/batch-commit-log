@@ -181,6 +181,7 @@ func (l *Log) DeleteThrough(seq uint64) (int, error) {
 		return 0, err
 	}
 	boundOf := make(map[int]uint64, len(l.segs))
+	segByFile := make(map[int]*segInfo, len(l.segs))
 	for i := range l.segs {
 		s := &l.segs[i]
 		bound := uint64(0)
@@ -191,6 +192,7 @@ func (l *Log) DeleteThrough(seq uint64) (int, error) {
 			bound = s.maxHole
 		}
 		boundOf[s.file] = bound
+		segByFile[s.file] = s
 	}
 	// Segment files absent from l.segs are empty (a torn first entry
 	// truncated to zero); their bound is 0. Take the contiguous prefix
@@ -208,6 +210,26 @@ func (l *Log) DeleteThrough(seq uint64) (int, error) {
 	}
 	segBound := deleted[len(deleted)-1]
 	retained := physical[len(deleted):]
+
+	// Consumer protection: the prefix is reclaimable only once every
+	// registered consumer has confirmed past the highest committed batch
+	// in it. Holes reserve no data and do not count. With no consumers at
+	// all the original behavior is unchanged. The check happens before
+	// anything is persisted or removed, so a blocked call leaves files,
+	// the index and idempotency keys byte-for-byte untouched.
+	var highestCommitted uint64
+	for _, n := range deleted {
+		if s, known := segByFile[n]; known && s.hasCommits && s.LastSeq > highestCommitted {
+			highestCommitted = s.LastSeq
+		}
+	}
+	if highestCommitted > 0 {
+		for _, confirmed := range l.consumers {
+			if highestCommitted > confirmed {
+				return 0, ErrRetentionBlocked
+			}
+		}
+	}
 
 	// 1) Durably commit the truncation point before removing anything.
 	// A failure here leaves the full old state byte-for-byte.
@@ -243,6 +265,11 @@ func (l *Log) DeleteThrough(seq uint64) (int, error) {
 		if err := removeFile(l.segmentPath(n)); err != nil && !os.IsNotExist(err) && firstErr == nil {
 			firstErr = err
 		}
+	}
+	// Removed files no longer need a durability barrier; a still-open
+	// future writer only ever touches the retained segments.
+	for _, n := range deleted {
+		delete(l.segDirty, n)
 	}
 	_ = syncDir(l.dir)
 
@@ -288,6 +315,14 @@ func (l *Log) DeleteThrough(seq uint64) (int, error) {
 	l.through = seq
 	if err := l.installSnapshot(p, retained); err != nil && firstErr == nil {
 		firstErr = err
+	}
+	// Rebuilt view: the deleted files already dropped out above; the
+	// retained committed segments may still hold bytes that no fsync has
+	// covered (Sync:false), so the next checkpoint must barrier them.
+	for i := range l.segs {
+		if l.segs[i].hasCommits {
+			l.segDirty[l.segs[i].file] = true
+		}
 	}
 	for s := range l.index {
 		if g, ok := oldGenBySeq[s]; ok {
