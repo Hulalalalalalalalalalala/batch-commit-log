@@ -28,6 +28,12 @@
 // unsupported image makes Open return ErrCorruptCheckpoint — and a
 // registered consumer keeps prefix history from being reclaimed until
 // it has confirmed it.
+//
+// Abort abandons a staged batch without committing it: the reserved
+// sequence becomes a permanent hole (durable across restarts and index
+// rebuilds, exactly like a crash-recovery hole), its idempotency key is
+// released for reuse, and every other staged or committed batch is
+// unaffected.
 package log
 
 import (
@@ -51,7 +57,7 @@ var (
 	ErrNotCommitted = errors.New("log: batch not committed")
 	// ErrUnknownBatch is returned for sequence 0, sequences that were
 	// never reserved, sequences beyond the reserved range, and batches
-	// that have already been committed.
+	// that have already been committed or aborted.
 	ErrUnknownBatch = errors.New("log: unknown batch")
 	// ErrCorruptSegment is returned when a segment file fails validation
 	// while opening or scanning the log.
@@ -123,6 +129,13 @@ var (
 	// sequence. Nothing is deleted — no segment, index or idempotency key
 	// changes — until every consumer has confirmed the prefix.
 	ErrRetentionBlocked = errors.New("log: retention blocked by consumer")
+	// ErrAbortFailed is returned by Abort when the hole marker or its
+	// index record cannot be written or made durable. The batch and its
+	// idempotency key stay staged under the original sequence, the
+	// partial marker and index record are rolled back, and retrying the
+	// abort — or committing the batch instead — cannot produce a
+	// duplicate record.
+	ErrAbortFailed = errors.New("log: abort failed")
 )
 
 var errClosed = errors.New("log: closed")
@@ -1289,7 +1302,10 @@ func (l *Log) Commit(b Batch) (uint64, error) {
 		return 0, errClosed
 	}
 	recs, ok := l.staged[b.seq]
-	if !ok || b.owner != l {
+	if !ok || recs == nil || b.owner != l {
+		// Not staged here (never reserved, already committed, or a
+		// permanent hole — crash-recovered or aborted), or owned by
+		// another Log or open.
 		return 0, ErrUnknownBatch
 	}
 	id := l.stagedID[b.seq]
@@ -1378,7 +1394,10 @@ func (l *Log) CommitGroup(batches []Batch) ([]uint64, error) {
 	keyed := false
 	for i, b := range batches {
 		recs, ok := l.staged[b.seq]
-		if !ok || b.owner != l {
+		if !ok || recs == nil || b.owner != l {
+			// Not staged here — including a permanent hole left by a
+			// crash recovery or an abort — or foreign-owned. Every
+			// other batch of the group stays staged.
 			return nil, ErrUnknownBatch
 		}
 		if _, dup := seen[b.seq]; dup {
@@ -1448,6 +1467,103 @@ func (l *Log) CommitGroup(batches []Batch) ([]uint64, error) {
 		l.segDirty[l.segIndex] = true
 	}
 	return seqs, nil
+}
+
+// Abort abandons a staged batch — anonymous or keyed, empty or not —
+// without committing it, turning its reserved sequence into a permanent
+// hole: the sequence reads as ErrNotCommitted, Scan skips it, and no
+// later Append ever reuses it, exactly like the hole a crash recovery
+// leaves behind. The batch's idempotency key, if any, is released:
+// appending under the same key again — with identical or different
+// records — reserves a fresh sequence. Every other staged or committed
+// batch and every other key is unaffected.
+//
+// The batch must be one this Log currently holds staged: a zero Batch,
+// a batch belonging to another Log or to a previous open, or a batch
+// already committed or aborted returns ErrUnknownBatch and changes
+// nothing. Commit and CommitGroup reject an aborted batch the same way.
+//
+// The hole is durable before Abort returns, regardless of Options.Sync:
+// a hole marker is appended to the current segment and fsynced, then an
+// index sidecar record is appended and fsynced, so the hole and the
+// sequence allocation survive restarts and index.idx rebuilds. A write,
+// close or sync failure returns ErrAbortFailed; the batch and its key
+// stay staged under the original sequence, the partial marker and index
+// record are rolled back, and retrying the abort — or committing the
+// batch instead — cannot produce a duplicate record. A crash mid-abort
+// is recovered by the ordinary torn-tail rules: the recognizable
+// aborted sequences stay permanent holes and are never reused, while
+// every durable commit is preserved.
+func (l *Log) Abort(b Batch) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return errClosed
+	}
+	recs, ok := l.staged[b.seq]
+	if !ok || recs == nil || b.owner != l {
+		// Never staged here, already committed, already aborted (a
+		// staged hole), or owned by another Log or open: nothing to
+		// abandon.
+		return ErrUnknownBatch
+	}
+	id := l.stagedID[b.seq]
+	marker := encodeHoles([]uint64{b.seq})
+	idxBefore := l.idxSize
+	off, err := l.writeEntry(marker)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrAbortFailed, err)
+	}
+	// The abort is durable regardless of Options.Sync: force the marker
+	// to disk before publishing it in the index.
+	if err := syncFile(l.file); err != nil {
+		l.rollbackEntry(off, idxBefore)
+		return fmt.Errorf("%w: %v", ErrAbortFailed, err)
+	}
+	rec := encodeHoleRecord(indexHole{
+		seg:     l.segIndex,
+		off:     off,
+		length:  len(marker),
+		diskCRC: binary.LittleEndian.Uint32(marker[len(marker)-4:]),
+		seqs:    []uint64{b.seq},
+	})
+	if err := l.appendAbortRecord(rec); err != nil {
+		// The index never advertises a hole whose abort failed: roll
+		// both files back and leave the batch staged for a retry.
+		l.rollbackEntry(off, idxBefore)
+		return fmt.Errorf("%w: %v", ErrAbortFailed, err)
+	}
+	// Best effort, as everywhere else: a segment file this marker may
+	// have just created gets its directory entry flushed.
+	_ = syncDir(l.dir)
+	// The sequence is now a permanent hole: staged as nil, exactly like
+	// a recovered crash hole, so Read, Scan, AckConsumer and
+	// DeleteThrough all treat it the same way.
+	l.staged[b.seq] = nil
+	delete(l.stagedID, b.seq)
+	if id != "" {
+		delete(l.ids, id)
+	}
+	l.recordHole(b.seq)
+	return nil
+}
+
+// recordHole notes a freshly aborted sequence in the segment listing so
+// prefix truncation counts it toward the segment's highest reservation,
+// exactly like a recovered crash hole. The marker always lands in the
+// current segment, the highest-numbered file, so appending a new
+// hole-only entry keeps the list ordered.
+func (l *Log) recordHole(seq uint64) {
+	for i := range l.segs {
+		if l.segs[i].file == l.segIndex {
+			if seq > l.segs[i].maxHole {
+				l.segs[i].maxHole = seq
+			}
+			l.segs[i].hasHoles = true
+			return
+		}
+	}
+	l.segs = append(l.segs, segInfo{file: l.segIndex, maxHole: seq, hasHoles: true})
 }
 
 // Read returns the records of the committed batch with the given

@@ -399,6 +399,22 @@ func (l *Log) appendIndexRecord(rec []byte) error {
 	return nil
 }
 
+// appendAbortRecord appends one hole record to the live sidecar after
+// the abort's marker is durable, and always fsyncs the sidecar: an
+// abort is durable regardless of Options.Sync. Any failure is returned
+// to the caller, which rolls the segment marker and this record back,
+// so a retry cannot duplicate either.
+func (l *Log) appendAbortRecord(rec []byte) error {
+	if l.idxFile == nil {
+		return errIndexInvalid
+	}
+	if _, err := l.idxFile.Write(rec); err != nil {
+		return err
+	}
+	l.idxSize += len(rec)
+	return syncFile(l.idxFile)
+}
+
 // truncateIndex rolls the sidecar back to size n after a failed commit,
 // mirroring the segment-entry rollback so no uncommitted record is left
 // behind and a retry cannot duplicate it.
